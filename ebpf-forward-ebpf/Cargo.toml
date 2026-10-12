@@ -1,0 +1,16 @@
+[package]
+name = "ebpf-forward-ebpf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ebpf-forward-common = { path = "../ebpf-forward-common" }
+
+aya-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "ebpf-forward"
+path = "src/main.rs"

@@ -1,0 +1,157 @@
+name: Build & Release
+
+# push / PR：构建 + 测试；推送 v* 标签：构建 + 测试 + 发布 GitHub Release
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 在 x86_64 上交叉编译（rust-lld，见 .cargo/config.toml）
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 Cargo.toml 的版本 $version 不一致，请用 scripts/release.sh 改版本并打标签"
+            exit 1
+          fi
+
+      - name: Load pinned toolchain versions
+        # EBPF_TOOLCHAIN / BPF_LINKER_VERSION，与 scripts/build.sh 共用
+        run: grep -E '^[A-Z_]+=' scripts/toolchain.env | tee -a "$GITHUB_ENV"
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --target ${{ matrix.target }}
+          rustup default stable
+          rustup toolchain install "$EBPF_TOOLCHAIN" --profile minimal --component rust-src
+
+      - name: Install bpf-linker
+        run: |
+          curl -fsSL --retry 3 \
+            "https://github.com/aya-rs/bpf-linker/releases/download/$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst" \
+            | tar --zstd -x -C "$RUNNER_TEMP"
+          install -m 755 "$(find "$RUNNER_TEMP" -type f -name bpf-linker | head -n1)" "$HOME/.cargo/bin/bpf-linker"
+          bpf-linker --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          # 不缓存 ~/.cargo/bin，否则恢复缓存时会用旧版 bpf-linker 覆盖上一步安装的版本
+          cache-bin: "false"
+
+      - name: Format check & unit tests
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          cargo fmt --all --check
+          cargo test --release
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Collect binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/ebpf-forward" "dist/ebpf-forward-${{ matrix.target }}"
+          file dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ebpf-forward-${{ matrix.target }}
+          path: dist/ebpf-forward-${{ matrix.target }}
+          if-no-files-found: error
+
+  e2e:
+    name: e2e (${{ matrix.mode }})
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [partial, full]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ebpf-forward-x86_64-unknown-linux-musl
+          path: dist
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 wireguard-tools ethtool tcpdump
+          sudo modprobe wireguard || true
+
+      - name: Kernel support check
+        run: |
+          chmod +x dist/ebpf-forward-*
+          uname -a
+          sudo dist/ebpf-forward-x86_64-unknown-linux-musl check </dev/null
+
+      - name: End-to-end test (network namespaces)
+        run: sudo bash scripts/netns-test.sh dist/ebpf-forward-x86_64-unknown-linux-musl ${{ matrix.mode }}
+
+  release:
+    name: publish release
+    needs: [build, e2e]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ebpf-forward-*
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare assets
+        run: |
+          # Release 里的 install.sh 默认从发布所在的仓库下载（fork 后无需改脚本）
+          sed "s|^REPO=\${REPO:-[^}]*}|REPO=\${REPO:-$GITHUB_REPOSITORY}|" scripts/install.sh > dist/install.sh
+          grep -qxF "REPO=\${REPO:-$GITHUB_REPOSITORY}" dist/install.sh
+          chmod +x dist/*
+          cd dist
+          sha256sum ebpf-forward-* install.sh > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 重新运行工作流时覆盖已上传的附件
+            gh release upload "$TAG" dist/* --clobber
+          else
+            flags=()
+            if [[ $TAG == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag "${flags[@]}"
+          fi

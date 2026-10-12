@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["ebpf-forward", "ebpf-forward-common", "ebpf-forward-ebpf"]
+default-members = ["ebpf-forward", "ebpf-forward-common"]
+
+[workspace.package]
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.91"
+
+[workspace.dependencies]
+aya = { version = "0.14.0", default-features = false }
+aya-build = { version = "0.2.0", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+clap = { version = "4.5.20", default-features = false, features = ["std"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+log = { version = "0.4.22", default-features = false }
+serde = { version = "1", default-features = false }
+toml = { version = "1", default-features = false }
+which = { version = "6.0.0", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.release.package.ebpf-forward-ebpf]
+debug = 2
+codegen-units = 1
+strip = false

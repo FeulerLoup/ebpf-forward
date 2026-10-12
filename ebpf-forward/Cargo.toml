@@ -1,0 +1,28 @@
+[package]
+name = "ebpf-forward"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ebpf-forward-common = { path = "../ebpf-forward-common", features = ["user"] }
+
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+clap = { workspace = true, features = ["derive", "help", "usage", "error-context"] }
+env_logger = { workspace = true, features = ["humantime"] }
+libc = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+toml = { workspace = true, features = ["parse", "serde", "display", "std"] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+ebpf-forward-ebpf = { path = "../ebpf-forward-ebpf" }
+
+[[bin]]
+name = "ebpf-forward"
+path = "src/main.rs"
