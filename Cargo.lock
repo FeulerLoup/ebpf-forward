@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "ebpf-forward"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -270,14 +270,14 @@ dependencies = [
 
 [[package]]
 name = "ebpf-forward-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "ebpf-forward-ebpf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aya-ebpf",
  "ebpf-forward-common",
