@@ -2,9 +2,13 @@
 
 //! eBPF 程序与用户态共享的 map 键值结构。
 //!
-//! 约定：所有 IPv4 地址和端口都按网络字节序存放（即与报文中的字节完全一致），
-//! 用户态写入时用 `u32::from_ne_bytes(ip.octets())` / `port.to_be()`。
+//! 约定：所有 IPv4/IPv6 地址和端口都按网络字节序存放（即与报文中的字节完全一致）。
+//! 地址统一存为 `[u32; 4]`：IPv4 放在下标 0（其余 3 项为 0），IPv6 占满 4 项，由 `family`
+//! （`AF_INET` / `AF_INET6`）区分协议族。
 //! 所有结构体都显式补齐 padding：哈希 map 的 key 不允许含未初始化字节。
+
+pub const AF_INET: u8 = 2;
+pub const AF_INET6: u8 = 10;
 
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
@@ -24,41 +28,54 @@ pub struct RuleKey {
     pub _pad: u8,
 }
 
-/// RULES 的 value。`target_addr == 0` 表示目标尚未解析成功，规则暂不生效。
+/// RULES 的 value。`family == 0` 表示目标尚未解析成功，规则暂不生效。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleValue {
-    pub target_addr: u32,
-    /// SNAT 使用的源地址（本机去往目标时的出口地址）。
-    pub snat_addr: u32,
+    pub target_addr: [u32; 4],
+    /// SNAT 使用的源地址（本机去往目标时的出口地址，与 target_addr 同协议族）。
+    pub snat_addr: [u32; 4],
     pub target_port: u16,
-    pub _pad: u16,
+    pub family: u8,
+    pub _pad: u8,
+}
+
+/// LOCAL_ADDRS 的 key：本机地址（含协议族）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalAddrKey {
+    pub addr: [u32; 4],
+    pub family: u8,
+    pub _pad: [u8; 3],
 }
 
 /// 连接跟踪 key：报文的五元组（转换前）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CtKey {
-    pub saddr: u32,
-    pub daddr: u32,
+    pub saddr: [u32; 4],
+    pub daddr: [u32; 4],
     pub sport: u16,
     pub dport: u16,
     pub proto: u8,
-    pub _pad: [u8; 3],
+    pub family: u8,
+    pub _pad: [u8; 2],
 }
 
-/// 连接跟踪 value：命中该 key 的报文要被改写成的五元组，以及状态。
+/// 连接跟踪 value：命中该 key 的报文要被改写成的五元组（可跨协议族 v4<->v6），以及状态。
 ///
 /// 每条连接有两项：原方向（客户端 -> 本机:监听端口）和回复方向（目标 -> 本机:SNAT端口）。
 /// 任一项的“改写结果”取反，恰好就是另一项的 key。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CtValue {
-    pub saddr: u32,
-    pub daddr: u32,
+    pub saddr: [u32; 4],
+    pub daddr: [u32; 4],
     pub sport: u16,
     pub dport: u16,
-    pub flags: u32,
+    pub flags: u16,
+    pub family: u8,
+    pub _pad: u8,
     /// bpf_ktime_get_ns()，即 CLOCK_MONOTONIC。
     pub last_seen: u64,
     pub created: u64,
@@ -73,19 +90,20 @@ impl CtValue {
             sport: self.dport,
             dport: self.sport,
             proto,
-            _pad: [0; 3],
+            family: self.family,
+            _pad: [0; 2],
         }
     }
 }
 
 /// 回复方向的项（目标 -> 客户端）。
-pub const CT_F_REPLY: u32 = 1 << 0;
+pub const CT_F_REPLY: u16 = 1 << 0;
 /// 回复方向已经收到过报文（目标有回应）。
-pub const CT_F_SEEN: u32 = 1 << 1;
+pub const CT_F_SEEN: u16 = 1 << 1;
 /// 本方向出现过 FIN。
-pub const CT_F_FIN: u32 = 1 << 2;
+pub const CT_F_FIN: u16 = 1 << 2;
 /// 本方向出现过 RST。
-pub const CT_F_RST: u32 = 1 << 3;
+pub const CT_F_RST: u16 = 1 << 3;
 
 /// CONFIG 数组（单元素）。
 #[repr(C)]
@@ -123,6 +141,7 @@ mod user {
 
     unsafe impl aya::Pod for RuleKey {}
     unsafe impl aya::Pod for RuleValue {}
+    unsafe impl aya::Pod for LocalAddrKey {}
     unsafe impl aya::Pod for CtKey {}
     unsafe impl aya::Pod for CtValue {}
     unsafe impl aya::Pod for GlobalConfig {}

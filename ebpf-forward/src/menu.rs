@@ -5,6 +5,7 @@ use crate::{
     config::{self, Config, Proto, Rule},
     install,
     manage::{self, confirm, err, info, prompt},
+    netinfo::fmt_host_port,
     status::Paths,
 };
 
@@ -30,17 +31,17 @@ fn add(paths: &Paths) -> Result<()> {
     };
     if let Some(r) = cfg.rules.iter().find(|r| r.listen_port == lport) {
         err(&format!(
-            "本机端口 {lport} 已存在转发规则 -> {}:{}，请先删除后再添加。",
-            r.target, r.target_port
+            "本机端口 {lport} 已存在转发规则 -> {}，请先删除后再添加。",
+            fmt_host_port(&r.target, r.target_port)
         ));
         return Ok(());
     }
     let target = loop {
-        let Some(t) = prompt("请输入目标地址（IPv4 或域名）: ") else {
+        let Some(t) = prompt("请输入目标地址（IPv4 / IPv6 或域名）: ") else {
             return Ok(());
         };
         match config::validate_target(&t) {
-            Ok(()) => break t,
+            Ok(()) => break config::normalize_target(&t).to_owned(),
             Err(e) => err(&e.to_string()),
         }
     };
@@ -63,8 +64,11 @@ fn add(paths: &Paths) -> Result<()> {
 
     println!();
     println!("即将添加转发规则:");
-    println!("  本机端口 {lport} ({proto}) -> {target}:{tport}");
-    if target.parse::<std::net::Ipv4Addr>().is_err() {
+    println!(
+        "  本机端口 {lport} ({proto}) -> {}",
+        fmt_host_port(&target, tport)
+    );
+    if target.parse::<std::net::IpAddr>().is_err() {
         println!("  目标为域名，每隔 resolve_interval（默认 300 秒）重新解析一次");
     }
     if !confirm("确认添加？", true) {
@@ -109,8 +113,10 @@ fn delete(paths: &Paths) -> Result<()> {
     let r = &cfg.rules[idx - 1];
     println!("即将删除转发规则:");
     println!(
-        "  本机端口 {} ({}) -> {}:{}",
-        r.listen_port, r.proto, r.target, r.target_port
+        "  本机端口 {} ({}) -> {}",
+        r.listen_port,
+        r.proto,
+        fmt_host_port(&r.target, r.target_port)
     );
     if !confirm("确认删除？", true) {
         info("已取消。");

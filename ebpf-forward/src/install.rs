@@ -85,12 +85,18 @@ pub fn install(paths: &Paths) -> Result<()> {
         info(&format!("已创建配置文件 {}", paths.config.display()));
     }
 
-    fs::write(SYSCTL_CONF, "net.ipv4.ip_forward = 1\n")
-        .with_context(|| format!("写入 {SYSCTL_CONF} 失败"))?;
+    fs::write(
+        SYSCTL_CONF,
+        "net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n",
+    )
+    .with_context(|| format!("写入 {SYSCTL_CONF} 失败"))?;
     if netinfo::enable_ip_forward().unwrap_or(false) {
         info("已开启 IPv4 转发");
     }
-    info(&format!("已持久化 net.ipv4.ip_forward=1 到 {SYSCTL_CONF}"));
+    if netinfo::enable_ipv6_forward().unwrap_or(false) {
+        info("已开启 IPv6 转发");
+    }
+    info(&format!("已持久化 IPv4/IPv6 转发配置到 {SYSCTL_CONF}"));
 
     if !has_systemd() {
         warn("未检测到 systemd：请自行配置开机启动，例如在 /etc/rc.local 中加入:");

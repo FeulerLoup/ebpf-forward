@@ -41,7 +41,7 @@ enum Cmd {
     Add {
         /// 本机监听端口
         listen_port: u16,
-        /// 目标 IPv4 地址或域名
+        /// 目标 IPv4 / IPv6 地址或域名
         target: String,
         /// 目标端口（默认与本机端口相同）
         target_port: Option<u16>,
@@ -50,7 +50,7 @@ enum Cmd {
         proto: Proto,
         /// 手动指定 SNAT 源地址（默认自动取去往目标的出口地址）
         #[arg(long)]
-        snat_ip: Option<std::net::Ipv4Addr>,
+        snat_ip: Option<std::net::IpAddr>,
         /// 备注
         #[arg(long, default_value = "")]
         comment: String,

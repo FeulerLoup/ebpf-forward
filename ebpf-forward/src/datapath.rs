@@ -1,18 +1,19 @@
 use std::{
     collections::{BTreeMap, HashMap as StdHashMap, HashSet},
-    net::Ipv4Addr,
+    hash::Hash,
+    net::IpAddr,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::{
-    Ebpf, EbpfLoader,
+    Ebpf, EbpfLoader, Pod,
     maps::{Array, HashMap, Map, MapData, PerCpuArray},
     programs::{SchedClassifier, TcAttachType, tc, tc::SchedClassifierLinkId},
 };
 use ebpf_forward_common::*;
 use log::{debug, info, warn};
 
-use crate::netinfo::{IfKind, Iface, ip_to_be};
+use crate::netinfo::{IfKind, Iface, ip_to_raw};
 
 pub const PROG_ETH: &str = "fwd_eth";
 pub const PROG_L3: &str = "fwd_l3";
@@ -61,7 +62,7 @@ pub struct Datapath {
     ebpf: Ebpf,
     rules: HashMap<MapData, RuleKey, RuleValue>,
     ct: HashMap<MapData, CtKey, CtValue>,
-    local_addrs: HashMap<MapData, u32, u32>,
+    local_addrs: HashMap<MapData, LocalAddrKey, u32>,
     if_mtu: HashMap<MapData, u32, u32>,
     config: Array<MapData, GlobalConfig>,
     attached: BTreeMap<String, Attached>,
@@ -129,12 +130,22 @@ impl Datapath {
         Ok(())
     }
 
-    pub fn set_local_addrs(&mut self, addrs: &HashSet<Ipv4Addr>) -> Result<()> {
-        let want: HashSet<u32> = addrs.iter().map(|a| ip_to_be(*a)).collect();
-        sync_set(
-            &mut self.local_addrs,
-            &want.iter().map(|a| (*a, 1)).collect(),
-        )
+    pub fn set_local_addrs(&mut self, addrs: &HashSet<IpAddr>) -> Result<()> {
+        let want: StdHashMap<LocalAddrKey, u32> = addrs
+            .iter()
+            .map(|&a| {
+                let (addr, family) = ip_to_raw(a);
+                (
+                    LocalAddrKey {
+                        addr,
+                        family,
+                        _pad: [0; 3],
+                    },
+                    1,
+                )
+            })
+            .collect();
+        sync_set(&mut self.local_addrs, &want)
     }
 
     pub fn set_if_mtu(&mut self, ifaces: &[Iface]) -> Result<()> {
@@ -288,7 +299,7 @@ impl Drop for Datapath {
 const ORPHAN_TIMEOUT: u64 = 30;
 
 /// 超时规则参考 Linux conntrack 的默认值（秒）。
-pub fn conn_timeout(proto: u8, orig: u32, reply: u32, t: &Timeouts) -> u64 {
+pub fn conn_timeout(proto: u8, orig: u16, reply: u16, t: &Timeouts) -> u64 {
     let any = orig | reply;
     if proto == PROTO_TCP {
         if any & CT_F_RST != 0 {
@@ -317,8 +328,11 @@ fn prog_for(kind: IfKind) -> Option<&'static str> {
     }
 }
 
-fn sync_set(map: &mut HashMap<MapData, u32, u32>, want: &StdHashMap<u32, u32>) -> Result<()> {
-    let stale: Vec<u32> = map
+fn sync_set<K: Copy + Eq + Hash + Pod>(
+    map: &mut HashMap<MapData, K, u32>,
+    want: &StdHashMap<K, u32>,
+) -> Result<()> {
+    let stale: Vec<K> = map
         .keys()
         .filter_map(Result::ok)
         .filter(|k| !want.contains_key(k))

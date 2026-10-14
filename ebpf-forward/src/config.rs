@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fmt, fs,
     io::Write as _,
-    net::Ipv4Addr,
+    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
     time::SystemTime,
@@ -77,21 +77,21 @@ impl<'de> Deserialize<'de> for Proto {
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub listen_port: u16,
-    /// IPv4 地址或域名。
+    /// IPv4 / IPv6 地址或域名。
     pub target: String,
     pub target_port: u16,
     #[serde(default)]
     pub proto: Proto,
     /// 手动指定 SNAT 源地址；默认自动使用本机去往目标的出口地址。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snat_ip: Option<Ipv4Addr>,
+    pub snat_ip: Option<IpAddr>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
 }
 
 impl Rule {
-    pub fn target_ip(&self) -> Option<Ipv4Addr> {
-        self.target.parse().ok()
+    pub fn target_ip(&self) -> Option<IpAddr> {
+        normalize_target(&self.target).parse().ok()
     }
 }
 
@@ -130,7 +130,7 @@ const HEADER: &str = "\
 # ebpf-forward 配置文件（由 ebpf-forward 维护，手动修改后约 2 秒内自动生效）
 #
 # resolve_interval   域名重新解析间隔（秒）
-# interfaces         挂载 eBPF 的网卡，留空 = 自动（所有已启用且有 IPv4 地址的网卡）
+# interfaces         挂载 eBPF 的网卡，留空 = 自动（所有已启用且有 IP 地址的网卡）
 # snat_port_min/max  SNAT 源端口范围，应避开 net.ipv4.ip_local_port_range
 # mss_clamp          对 SYN 做 MSS 钳制，出口 MTU 较小（如 WireGuard）时避免大包被丢弃
 # ct_max             连接跟踪表容量（每条连接占 2 项，修改后需重启服务）
@@ -139,11 +139,11 @@ const HEADER: &str = "\
 #
 # 规则示例：
 # [[rule]]
-# listen_port = 8080         # 本机端口
-# target = \"example.com\"     # 目标 IPv4 或域名
+# listen_port = 8080         # 本机端口（同时接受 IPv4 与 IPv6 连入）
+# target = \"example.com\"     # 目标 IPv4、IPv6 或域名
 # target_port = 80           # 目标端口
 # proto = \"tcp+udp\"          # tcp / udp / tcp+udp
-# snat_ip = \"1.2.3.4\"        # 可选：手动指定 SNAT 源地址
+# snat_ip = \"1.2.3.4\"        # 可选：手动指定 SNAT 源地址（需与目标同为 IPv4 或 IPv6）
 # comment = \"备注\"           # 可选
 
 ";
@@ -227,19 +227,33 @@ impl Config {
     }
 }
 
+pub fn normalize_target(t: &str) -> &str {
+    let t = t.trim();
+    t.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(t)
+}
+
 pub fn validate_rule(r: &Rule) -> Result<()> {
     if r.listen_port == 0 || r.target_port == 0 {
         bail!("端口必须在 1-65535 之间");
     }
-    validate_target(&r.target)
+    validate_target(&r.target)?;
+    if let (Some(tip), Some(sip)) = (r.target_ip(), r.snat_ip)
+        && tip.is_ipv4() != sip.is_ipv4()
+    {
+        bail!("snat_ip {sip} 与目标 {tip} 协议族不一致（需同为 IPv4 或同为 IPv6）");
+    }
+    Ok(())
 }
 
 pub fn validate_target(t: &str) -> Result<()> {
-    if t.parse::<Ipv4Addr>().is_ok() {
+    let t = normalize_target(t);
+    if t.parse::<IpAddr>().is_ok() {
         return Ok(());
     }
     if t.contains(':') {
-        bail!("目标 `{t}` 是 IPv6 地址，当前仅支持 IPv4");
+        bail!("目标 `{t}` 不是合法的 IPv6 地址");
     }
     let looks_like_ip = t
         .split('.')
@@ -260,7 +274,7 @@ pub fn validate_target(t: &str) -> Result<()> {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         });
     if !valid {
-        bail!("目标 `{t}` 既不是 IPv4 地址也不是合法域名");
+        bail!("目标 `{t}` 既不是合法 IP（IPv4/IPv6）也不是合法域名");
     }
     Ok(())
 }
@@ -331,11 +345,14 @@ mod tests {
     #[test]
     fn targets() {
         assert!(validate_target("1.2.3.4").is_ok());
+        assert!(validate_target("2001:db8::1").is_ok());
+        assert!(validate_target("[2001:db8::1]").is_ok());
+        assert!(validate_target("::1").is_ok());
         assert!(validate_target("a-b.example.com").is_ok());
         assert!(validate_target("example.com.").is_ok());
         assert!(validate_target("1.2.3").is_err());
         assert!(validate_target("999.1.1.1").is_err());
-        assert!(validate_target("::1").is_err());
+        assert!(validate_target("2001:db8::gggg").is_err());
         assert!(validate_target("bad host").is_err());
         assert_eq!("all".parse::<Proto>().unwrap(), Proto::Both);
     }

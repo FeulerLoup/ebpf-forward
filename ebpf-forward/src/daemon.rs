@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Write as _,
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, ToSocketAddrs},
     os::fd::AsRawFd,
     path::PathBuf,
     sync::{
@@ -20,7 +20,7 @@ use log::{error, info, warn};
 use crate::{
     config::{self, Config},
     datapath::{Datapath, GcStats, Timeouts},
-    netinfo::{self, IfKind, Iface, ip_to_be},
+    netinfo::{self, IfKind, Iface, fmt_host_port, ip_to_raw},
     status::{IfaceStatus, Paths, RuleStatus, Status, unix_now},
 };
 
@@ -102,22 +102,36 @@ pub fn kernel_release() -> String {
         .unwrap_or_default()
 }
 
-type ResolveBatch = Vec<(String, Result<Vec<Ipv4Addr>, String>)>;
+type ResolveBatch = Vec<(String, Result<Vec<IpAddr>, String>)>;
 
-fn resolve(host: &str) -> Result<Vec<Ipv4Addr>, String> {
+fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
     let addrs = (host, 0u16).to_socket_addrs().map_err(|e| e.to_string())?;
-    let mut v: Vec<Ipv4Addr> = Vec::new();
+    let mut v: Vec<IpAddr> = Vec::new();
     for a in addrs {
-        if let SocketAddr::V4(a) = a
-            && !v.contains(a.ip())
-        {
-            v.push(*a.ip());
+        let ip = a.ip();
+        if !v.contains(&ip) {
+            v.push(ip);
         }
     }
     if v.is_empty() {
-        Err("没有 IPv4 (A) 记录".into())
+        Err("没有 A / AAAA 记录".into())
     } else {
         Ok(v)
+    }
+}
+
+fn is_special_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some()
+        }
     }
 }
 
@@ -138,7 +152,8 @@ fn spawn_resolver(domains: Vec<String>) -> mpsc::Receiver<ResolveBatch> {
 }
 
 struct Resolved {
-    ip: Option<Ipv4Addr>,
+    ip: Option<IpAddr>,
+    candidates: Vec<IpAddr>,
     error: Option<String>,
     at: u64,
 }
@@ -172,7 +187,12 @@ pub fn run(paths: Paths) -> Result<()> {
     match netinfo::enable_ip_forward() {
         Ok(true) => info!("已开启 net.ipv4.ip_forward（bpf_fib_lookup 要求入口网卡允许转发）"),
         Ok(false) => {}
-        Err(e) => warn!("开启 net.ipv4.ip_forward 失败: {e}，转发将无法工作"),
+        Err(e) => warn!("开启 net.ipv4.ip_forward 失败: {e}，IPv4 转发将无法工作"),
+    }
+    match netinfo::enable_ipv6_forward() {
+        Ok(true) => info!("已开启 net.ipv6.conf.all.forwarding"),
+        Ok(false) => {}
+        Err(e) => warn!("开启 net.ipv6.conf.all.forwarding 失败: {e}，IPv6 转发将无法工作"),
     }
 
     let dp = Datapath::load(cfg.ct_max)?;
@@ -277,15 +297,28 @@ impl Daemon {
         for (domain, res) in batch {
             let ent = self.resolved.entry(domain.clone()).or_insert(Resolved {
                 ip: None,
+                candidates: Vec::new(),
                 error: None,
                 at: 0,
             });
             match res {
                 Ok(ips) => {
-                    // 当前 IP 仍在结果里就不切换，避免轮询 DNS 导致目标来回变化
+                    // 当前 IP 仍在结果里且路由可达时就不切换，避免轮询 DNS 导致目标来回变化；
+                    // 否则优先挑选本机有去往路由的地址（例如纯 v4 机器面对双栈域名时自动选 A 记录）。
                     let new = match ent.ip {
-                        Some(cur) if ips.contains(&cur) => cur,
-                        _ => ips[0],
+                        Some(cur)
+                            if ips.contains(&cur)
+                                && !is_special_ip(cur)
+                                && netinfo::source_addr_for(cur).is_ok() =>
+                        {
+                            cur
+                        }
+                        _ => ips
+                            .iter()
+                            .copied()
+                            .find(|&ip| !is_special_ip(ip) && netinfo::source_addr_for(ip).is_ok())
+                            .or_else(|| ent.ip.filter(|cur| ips.contains(cur)))
+                            .unwrap_or(ips[0]),
                     };
                     match ent.ip {
                         None => info!("域名 {domain} 解析为 {new}"),
@@ -293,6 +326,7 @@ impl Daemon {
                         _ => {}
                     }
                     ent.ip = Some(new);
+                    ent.candidates = ips;
                     ent.error = None;
                     ent.at = now;
                 }
@@ -338,17 +372,18 @@ impl Daemon {
                 return;
             }
         };
-        let local: HashSet<Ipv4Addr> = ifaces
+        let local: HashSet<IpAddr> = ifaces
             .iter()
             .flat_map(|i| i.addrs.iter().copied())
             .collect();
         let mut warnings = Vec::new();
         if !netinfo::ip_forward_enabled() {
             warnings.push(
-                "net.ipv4.ip_forward 已被关闭，转发无法工作（sysctl -w net.ipv4.ip_forward=1）"
+                "net.ipv4.ip_forward 已被关闭，IPv4 转发无法工作（sysctl -w net.ipv4.ip_forward=1）"
                     .into(),
             );
         }
+        let mut need_v6_fwd = false;
 
         let mut want: HashMap<RuleKey, RuleValue> = HashMap::new();
         let mut statuses = Vec::new();
@@ -380,10 +415,19 @@ impl Daemon {
                     Some(r) => {
                         st.resolved_at = (r.at > 0).then_some(r.at);
                         st.error = r.error.clone();
-                        if r.ip.is_none() {
+                        let picked = match (r.ip, rule.snat_ip) {
+                            (Some(ip), Some(snat)) if ip.is_ipv4() != snat.is_ipv4() => r
+                                .candidates
+                                .iter()
+                                .copied()
+                                .find(|c| c.is_ipv4() == snat.is_ipv4())
+                                .or(Some(ip)),
+                            (ip, _) => ip,
+                        };
+                        if picked.is_none() {
                             st.state = "error".into();
                         }
-                        r.ip
+                        picked
                     }
                     None => None,
                 },
@@ -393,19 +437,20 @@ impl Daemon {
                 continue;
             };
             st.ip = Some(ip.to_string());
+            if ip.is_ipv6() {
+                need_v6_fwd = true;
+            }
 
-            if local.contains(&ip)
-                || ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-                || ip.is_multicast()
-            {
+            if local.contains(&ip) || is_special_ip(ip) {
                 st.state = "error".into();
                 st.error = Some("目标是本机或特殊地址，eBPF 转发不支持".into());
                 statuses.push(st);
                 continue;
             }
             let snat = match rule.snat_ip {
+                Some(s) if s.is_ipv4() != ip.is_ipv4() => {
+                    Err(format!("snat_ip {s} 与目标 {ip} 协议族不一致"))
+                }
                 Some(s) if !local.contains(&s) => Err(format!("snat_ip {s} 不是本机地址")),
                 Some(s) => Ok(s),
                 None => {
@@ -427,10 +472,13 @@ impl Daemon {
                 via_ifaces.insert(i.name.clone());
             }
             st.state = "ok".into();
+            let (target_addr, family) = ip_to_raw(ip);
+            let (snat_addr, _) = ip_to_raw(snat);
             let value = RuleValue {
-                target_addr: ip_to_be(ip),
-                snat_addr: ip_to_be(snat),
+                target_addr,
+                snat_addr,
                 target_port: rule.target_port.to_be(),
+                family,
                 _pad: 0,
             };
             for p in rule.proto.numbers() {
@@ -444,6 +492,14 @@ impl Daemon {
                 );
             }
             statuses.push(st);
+        }
+
+        let has_v6 = need_v6_fwd || local.iter().any(|a| a.is_ipv6() && !is_special_ip(*a));
+        if has_v6 && !netinfo::ipv6_forward_enabled() {
+            warnings.push(
+                "net.ipv6.conf.all.forwarding 已被关闭，IPv6 转发无法工作（sysctl -w net.ipv6.conf.all.forwarding=1）"
+                    .into(),
+            );
         }
 
         let global = GlobalConfig {
@@ -493,17 +549,17 @@ impl Daemon {
             let changed =
                 prev.is_none_or(|p| p.state != st.state || p.ip != st.ip || p.snat != st.snat);
             if changed && st.state != "pending" {
+                let dst = fmt_host_port(&st.target, st.target_port);
                 match &st.error {
                     Some(e) if st.state == "error" => warn!(
-                        "规则 {}/{} -> {}:{} 未生效: {e}",
-                        st.listen_port, st.proto, st.target, st.target_port
+                        "规则 {}/{} -> {} 未生效: {e}",
+                        st.listen_port, st.proto, dst
                     ),
                     _ => info!(
-                        "规则 {}/{} -> {}:{} 生效: 目标 {}，SNAT {}{}",
+                        "规则 {}/{} -> {} 生效: 目标 {}，SNAT {}{}",
                         st.listen_port,
                         st.proto,
-                        st.target,
-                        st.target_port,
+                        dst,
                         st.ip.as_deref().unwrap_or("?"),
                         st.snat.as_deref().unwrap_or("?"),
                         st.via

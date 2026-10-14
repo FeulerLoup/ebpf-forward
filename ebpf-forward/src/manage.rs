@@ -13,7 +13,7 @@ use crate::{
     config::{self, Config, Proto, Rule},
     daemon::monotonic_ns,
     datapath::{self, PROG_ETH, PROG_L3, Timeouts, conn_timeout},
-    netinfo::{self, be_to_ip},
+    netinfo::{self, fmt_addr_port, fmt_host_port, raw_to_ip},
     status::{self, Paths, Status, fmt_ago, fmt_bytes, fmt_duration},
 };
 
@@ -66,8 +66,9 @@ pub fn pad(s: &str, width: usize) -> String {
 }
 
 /// 新增规则。`confirmed` 为 true 时跳过端口占用确认（交互菜单里已经问过）。
-pub fn add(paths: &Paths, rule: Rule, confirmed: bool) -> Result<()> {
+pub fn add(paths: &Paths, mut rule: Rule, confirmed: bool) -> Result<()> {
     require_root()?;
+    rule.target = config::normalize_target(&rule.target).to_owned();
     config::validate_rule(&rule)?;
     let mut cfg = Config::load(&paths.config)?;
     if let Some(r) = cfg
@@ -76,11 +77,10 @@ pub fn add(paths: &Paths, rule: Rule, confirmed: bool) -> Result<()> {
         .find(|r| r.listen_port == rule.listen_port && r.proto.overlaps(rule.proto))
     {
         bail!(
-            "本机端口 {} ({}) 已存在转发规则 -> {}:{}，请先删除后再添加",
+            "本机端口 {} ({}) 已存在转发规则 -> {}，请先删除后再添加",
             r.listen_port,
             r.proto,
-            r.target,
-            r.target_port
+            fmt_host_port(&r.target, r.target_port)
         );
     }
     if !confirmed && !check_port_conflict(rule.listen_port, rule.proto) {
@@ -88,8 +88,10 @@ pub fn add(paths: &Paths, rule: Rule, confirmed: bool) -> Result<()> {
         return Ok(());
     }
     let summary = format!(
-        "{} ({}) -> {}:{}",
-        rule.listen_port, rule.proto, rule.target, rule.target_port
+        "{} ({}) -> {}",
+        rule.listen_port,
+        rule.proto,
+        fmt_host_port(&rule.target, rule.target_port)
     );
     cfg.rules.push(rule);
     cfg.save(&paths.config)?;
@@ -202,7 +204,7 @@ pub fn list(paths: &Paths) -> Result<()> {
     );
     println!("{}", "─".repeat(96));
     for (i, r) in cfg.rules.iter().enumerate() {
-        let target = format!("{}:{}", r.target, r.target_port);
+        let target = fmt_host_port(&r.target, r.target_port);
         let rs = st
             .as_ref()
             .and_then(|s| s.rule(r.listen_port, &r.proto.to_string()));
@@ -281,14 +283,12 @@ pub fn conns(paths: &Paths) -> Result<()> {
         let age = now.saturating_sub(v.created) / 1_000_000_000;
         let timeout = conn_timeout(k.proto, v.flags, rflags, &t);
         let proto = if k.proto == PROTO_TCP { "tcp" } else { "udp" };
-        let client = format!("{}:{}", be_to_ip(k.saddr), u16::from_be(k.sport));
-        let local = format!("{}:{}", be_to_ip(k.daddr), u16::from_be(k.dport));
+        let client = fmt_addr_port(raw_to_ip(k.saddr, k.family), u16::from_be(k.sport));
+        let local = fmt_addr_port(raw_to_ip(k.daddr, k.family), u16::from_be(k.dport));
         let nat = format!(
-            "{}:{} -> {}:{}",
-            be_to_ip(v.saddr),
-            u16::from_be(v.sport),
-            be_to_ip(v.daddr),
-            u16::from_be(v.dport)
+            "{} -> {}",
+            fmt_addr_port(raw_to_ip(v.saddr, v.family), u16::from_be(v.sport)),
+            fmt_addr_port(raw_to_ip(v.daddr, v.family), u16::from_be(v.dport))
         );
         rows.push((
             v.created,

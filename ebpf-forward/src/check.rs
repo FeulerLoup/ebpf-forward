@@ -63,7 +63,7 @@ fn nft_dnat_ports() -> Vec<(u16, u16)> {
 /// 只认 DNAT / redirect 动作；`ct status dnat snat to` 这类回源 SNAT 规则里的 dport 是目标端口，不算。
 fn parse_dnat_ports(ruleset: &str) -> Vec<(u16, u16)> {
     let is_dnat = |l: &&str| {
-        ["dnat to", "dnat ip to", "redirect to"]
+        ["dnat to", "dnat ip to", "dnat ip6 to", "redirect to"]
             .iter()
             .any(|a| l.contains(a))
     };
@@ -236,6 +236,11 @@ fn diagnose(paths: &Paths) {
     } else {
         warn("IPv4 转发: 未开启（守护进程启动时会自动开启；install 会写入 /etc/sysctl.d 持久化）");
     }
+    if netinfo::ipv6_forward_enabled() {
+        info("IPv6 转发: 已开启");
+    } else {
+        warn("IPv6 转发: 未开启（守护进程启动时会自动开启；install 会写入 /etc/sysctl.d 持久化）");
+    }
 
     match systemctl_state() {
         Some(s) if s == "active" => info("systemd 服务: 运行中"),
@@ -258,11 +263,10 @@ fn diagnose(paths: &Paths) {
             ));
             for r in st.rules.iter().filter(|r| r.state != "ok") {
                 warn(&format!(
-                    "规则 {}/{} -> {}:{} 未生效: {}",
+                    "规则 {}/{} -> {} 未生效: {}",
                     r.listen_port,
                     r.proto,
-                    r.target,
-                    r.target_port,
+                    netinfo::fmt_host_port(&r.target, r.target_port),
                     r.error.as_deref().unwrap_or(&r.state)
                 ));
             }
@@ -316,9 +320,10 @@ fn diagnose(paths: &Paths) {
             && confirm("是否测试目标连通性（本机直连目标 TCP 端口）？", false)
         {
             for (ip, port) in targets {
-                let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() else {
+                let Ok(ip) = ip.parse::<std::net::IpAddr>() else {
                     continue;
                 };
+                let addr = SocketAddr::new(ip, port);
                 match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
                     Ok(_) => println!("  测试 {addr} (TCP) ... \x1b[32m通\x1b[0m"),
                     Err(e) => println!("  测试 {addr} (TCP) ... \x1b[31m不通 ({e})\x1b[0m"),

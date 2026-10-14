@@ -77,9 +77,10 @@ capture_wait() { wait "${CAPS[@]}"; CAPS=(); }
 
 # 客户端跑 iperf3；服务端上一轮测试还没收尾时会回 “the server is busy”，稍等重试
 iperf_c() {
-    local out
+    local dst=10.10.1.1 out
+    if [[ ${1:-} == -dst ]]; then dst=$2; shift 2; fi
     for _ in 1 2 3 4 5; do
-        out=$(nsx $C timeout 30 iperf3 -c 10.10.1.1 -t 3 -f m "$@" 2>&1) && { echo "$out"; return 0; }
+        out=$(nsx $C timeout 30 iperf3 -c "$dst" -t 3 -f m "$@" 2>&1) && { echo "$out"; return 0; }
         grep -q 'server is busy' <<<"$out" || break
         sleep 1
     done
@@ -127,6 +128,13 @@ ip -n $T addr add 10.10.3.254/24 dev rt-b
 ip -n $S addr add 10.10.3.2/24 dev srv0
 ip -n $S addr add 10.10.3.3/24 dev srv0
 ip -n $G addr add 10.30.0.2/24 dev g-r
+ip -n $C -6 addr add fd00:1::2/64 dev cli0 nodad
+ip -n $R -6 addr add fd00:1::1/64 dev r-cli nodad
+ip -n $R -6 addr add fd00:2::1/64 dev r-up nodad
+ip -n $T -6 addr add fd00:2::fe/64 dev rt-a nodad
+ip -n $T -6 addr add fd00:3::fe/64 dev rt-b nodad
+ip -n $S -6 addr add fd00:3::2/64 dev srv0 nodad
+ip -n $S -6 addr add fd00:3::3/64 dev srv0 nodad
 for p in "$C cli0" "$R r-cli" "$R r-up" "$R r-wg" "$T rt-a" "$T rt-b" "$S srv0" "$G g-r"; do
     set -- $p
     ip -n "$1" link set "$2" up
@@ -135,9 +143,13 @@ for p in "$C cli0" "$R r-cli" "$R r-up" "$R r-wg" "$T rt-a" "$T rt-b" "$S srv0" 
 done
 ip -n $R route add 10.10.3.0/24 via 10.10.2.254
 ip -n $S route add 10.10.2.0/24 via 10.10.3.254
-# 两端网卡都是 1500，只有路由器转发时受 1400 限制：客户端上传的大包会触发路由器回 ICMP “需要分片”
+ip -n $R -6 route add fd00:3::/64 via fd00:2::fe
+ip -n $S -6 route add fd00:2::/64 via fd00:3::fe
+# 两端网卡都是 1500，只有路由器转发时受 1400 限制：客户端上传的大包会触发路由器回 ICMP “需要分片 / Packet Too Big”
 ip -n $T route replace 10.10.3.0/24 dev rt-b mtu lock 1400
+ip -n $T -6 route replace fd00:3::/64 dev rt-b metric 256 mtu lock 1400
 nsx $T sysctl -qw net.ipv4.ip_forward=1
+nsx $T sysctl -qw net.ipv6.conf.all.forwarding=1
 
 WG=0
 if [[ ${NO_WG:-0} != 1 ]] && command -v wg >/dev/null && ip -n $R link add wg0 type wireguard 2>/dev/null; then
@@ -145,10 +157,12 @@ if [[ ${NO_WG:-0} != 1 ]] && command -v wg >/dev/null && ip -n $R link add wg0 t
     (umask 077; wg genkey >$W/kr; wg genkey >$W/kg)
     PR=$(wg pubkey <$W/kr); PG=$(wg pubkey <$W/kg)
     ip -n $G link add wg0 type wireguard
-    nsx $R wg set wg0 private-key $W/kr listen-port 51820 peer "$PG" allowed-ips 10.20.0.2/32 endpoint 10.30.0.2:51820
-    nsx $G wg set wg0 private-key $W/kg listen-port 51820 peer "$PR" allowed-ips 10.20.0.1/32 endpoint 10.30.0.1:51820
+    nsx $R wg set wg0 private-key $W/kr listen-port 51820 peer "$PG" allowed-ips 10.20.0.2/32,fd00:20::2/128 endpoint 10.30.0.2:51820
+    nsx $G wg set wg0 private-key $W/kg listen-port 51820 peer "$PR" allowed-ips 10.20.0.1/32,fd00:20::1/128 endpoint 10.30.0.1:51820
     ip -n $R addr add 10.20.0.1/24 dev wg0
     ip -n $G addr add 10.20.0.2/24 dev wg0
+    ip -n $R -6 addr add fd00:20::1/64 dev wg0 nodad
+    ip -n $G -6 addr add fd00:20::2/64 dev wg0 nodad
     ip -n $R link set wg0 up
     ip -n $G link set wg0 up
 else
@@ -166,7 +180,8 @@ esac
 
 cat >$W/udp_echo.py <<'EOF'
 import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+af = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
+s = socket.socket(af, socket.SOCK_DGRAM)
 s.bind((sys.argv[1], int(sys.argv[2])))
 while True:
     d, a = s.recvfrom(65535)
@@ -174,7 +189,8 @@ while True:
 EOF
 cat >$W/udp_client.py <<'EOF'
 import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+af = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
+s = socket.socket(af, socket.SOCK_DGRAM)
 s.settimeout(3)
 s.connect((sys.argv[1], int(sys.argv[2])))
 s.send(b"ping")
@@ -220,16 +236,21 @@ echo srv-A >$W/a/who; echo srv-B >$W/b/who; echo srv-WG >$W/g/who; echo client-s
 head -c 4194304 /dev/urandom >$W/a/big; cp $W/a/big $W/g/big
 head -c 262144 /dev/urandom >$W/a/mid
 svc $W/http-a.log $S python3 -m http.server 80 --bind 10.10.3.2 --directory $W/a
+svc $W/http-a6.log $S python3 -m http.server 80 --bind fd00:3::2 --directory $W/a
 svc $W/http-b.log $S python3 -m http.server 80 --bind 10.10.3.3 --directory $W/b
+svc $W/http-b6.log $S python3 -m http.server 80 --bind fd00:3::3 --directory $W/b
 svc $W/http-c.log $C python3 -m http.server 80 --bind 10.10.1.2 --directory $W/c
 svc $W/udp-echo.log $S python3 $W/udp_echo.py 10.10.3.2 5353
+svc $W/udp-echo6.log $S python3 $W/udp_echo.py fd00:3::2 5353
 svc $W/peer-echo.log $S python3 $W/peer_echo.py 10.10.3.2 81
 nsx $S iperf3 -s -B 10.10.3.2 -D --logfile $W/iperf-s.log
-READY=("$S t 10.10.3.2:80" "$S t 10.10.3.3:80" "$C t 10.10.1.2:80" "$S u 10.10.3.2:5353" "$S t 10.10.3.2:81" "$S t 10.10.3.2:5201")
+nsx $S iperf3 -s -B fd00:3::2 -D --logfile $W/iperf-s6.log
+READY=("$S t 10.10.3.2:80" "$S t [fd00:3::2]:80" "$S t 10.10.3.3:80" "$S t [fd00:3::3]:80" "$C t 10.10.1.2:80" "$S u 10.10.3.2:5353" "$S u [fd00:3::2]:5353" "$S t 10.10.3.2:81" "$S t 10.10.3.2:5201" "$S t [fd00:3::2]:5201")
 if [[ $WG == 1 ]]; then
     svc $W/http-g.log $G python3 -m http.server 80 --bind 10.20.0.2 --directory $W/g
+    svc $W/http-g6.log $G python3 -m http.server 80 --bind fd00:20::2 --directory $W/g
     nsx $G iperf3 -s -B 10.20.0.2 -D --logfile $W/iperf-g.log
-    READY+=("$G t 10.20.0.2:80" "$G t 10.20.0.2:5201")
+    READY+=("$G t 10.20.0.2:80" "$G t [fd00:20::2]:80" "$G t 10.20.0.2:5201")
 fi
 mkdir -p /etc/netns/$R && echo "10.10.3.2 srv.test" >/etc/netns/$R/hosts
 for s in "${READY[@]}"; do
@@ -241,15 +262,20 @@ echo 'resolve_interval = 5' >$W/config.toml
 start_daemon && ok "守护进程已启动" || { bad "守护进程启动失败"; cat $W/daemon.log; exit 1; }
 {
     efw add 8080 10.10.3.2 80 -p tcp -y
+    efw add 8086 fd00:3::2 80 -p tcp -y
     efw add 9090 srv.test 80 -p tcp -y --comment "域名目标"
     efw add 5353 10.10.3.2 -p udp -y
+    efw add 5356 fd00:3::2 5353 -p udp -y
     efw add 6000 10.10.3.2 -p udp -y
+    efw add 6006 fd00:3::2 6000 -p udp -y
     efw add 5201 10.10.3.2 -p tcp -y
+    efw add 5206 fd00:3::2 5201 -p tcp -y
     efw add 8181 10.10.1.2 80 -y
     efw add 8282 10.10.3.2 81 -p tcp -y
     if [[ $WG == 1 ]]; then
         efw add 7070 10.20.0.2 80 -p tcp -y
         efw add 7071 10.20.0.2 5201 -p tcp -y
+        efw add 7076 fd00:20::2 80 -p tcp -y
     fi
 } >$W/cli.log 2>&1
 efw list
@@ -352,12 +378,84 @@ ip -n $R link set r-up mtu 1500
 ip -n $T link set rt-a mtu 1500
 resync
 
+step "IPv6 与跨协议族转发（v6->v6、v4->v6、v6->v4）"
+out=$(nsx $C curl -s --max-time 5 http://[fd00:1::1]:8086/who)
+[[ $out == srv-A ]] && ok "v6 进 v6 出 TCP (8086 -> [fd00:3::2]:80) 返回 $out" || bad "v6->v6 TCP 返回 '$out'"
+grep -q '^fd00:2::1 ' $W/http-a6.log && ok "v6 目标看到的源地址为转发机 IPv6 SNAT 地址 fd00:2::1" \
+    || bad "v6 SNAT 不符: $(tail -1 $W/http-a6.log)"
+
+capture $S srv0 'ip6 and tcp port 80' 10 $W/ck-v46-srv.txt
+capture $C cli0 'ip and tcp port 8086' 100 $W/ck-v46-cli.txt
+out=$(nsx $C curl -s --max-time 10 http://10.10.1.1:8086/mid | wc -c)
+capture_wait
+[[ $out -eq 262144 ]] && ok "v4 进 v6 出 TCP (8086 -> [fd00:3::2]:80) 传输 256 KiB 成功" || bad "v4->v6 TCP 传输字节数 '$out'"
+csum_check $W/ck-v46-srv.txt "v4->v6 目标机收到的 IPv6 TCP " '(correct)' 'incorrect'
+csum_check $W/ck-v46-cli.txt "v4->v6 客户端收到的 IPv4 TCP " '(correct)' 'incorrect'
+
+capture $S srv0 'ip and tcp port 80' 10 $W/ck-v64-srv.txt
+capture $C cli0 'ip6 and tcp port 8080' 100 $W/ck-v64-cli.txt
+out=$(nsx $C curl -s --max-time 10 http://[fd00:1::1]:8080/mid | wc -c)
+capture_wait
+[[ $out -eq 262144 ]] && ok "v6 进 v4 出 TCP ([fd00:1::1]:8080 -> 10.10.3.2:80) 传输 256 KiB 成功" || bad "v6->v4 TCP 传输字节数 '$out'"
+csum_check $W/ck-v64-srv.txt "v6->v4 目标机收到的 IPv4 TCP " '(correct)' 'incorrect'
+csum_check $W/ck-v64-cli.txt "v6->v4 客户端收到的 IPv6 TCP " '(correct)' 'incorrect'
+
+out=$(nsx $C python3 $W/udp_client.py fd00:1::1 5356)
+[[ $out == "ping from fd00:2::1:"* ]] && ok "v6 进 v6 出 UDP 回显: $out" || bad "v6->v6 UDP 回显: '$out'"
+out=$(nsx $C python3 $W/udp_client.py 10.10.1.1 5356)
+[[ $out == "ping from fd00:2::1:"* ]] && ok "v4 进 v6 出 UDP 回显: $out" || bad "v4->v6 UDP 回显: '$out'"
+out=$(nsx $C python3 $W/udp_client.py fd00:1::1 5353)
+[[ $out == "ping from 10.10.2.1:"* ]] && ok "v6 进 v4 出 UDP 回显: $out" || bad "v6->v4 UDP 回显: '$out'"
+
+out=$(nsx $C python3 $W/udp_client.py fd00:1::1 6006)
+[[ $out == REFUSED ]] && ok "v6->v6 ICMPv6 端口不可达转换成功（ECONNREFUSED）" || bad "v6->v6 ICMPv6 端口不可达: '$out'"
+out=$(nsx $C python3 $W/udp_client.py 10.10.1.1 6006)
+[[ $out == REFUSED ]] && ok "v4->v6 ICMPv6->ICMPv4 端口不可达转换成功（ECONNREFUSED）" || bad "v4->v6 端口不可达: '$out'"
+out=$(nsx $C python3 $W/udp_client.py fd00:1::1 6000)
+[[ $out == REFUSED ]] && ok "v6->v4 ICMPv4->ICMPv6 端口不可达转换成功（ECONNREFUSED）" || bad "v6->v4 端口不可达: '$out'"
+
+ip -n $C route flush cache
+out=$(iperf_c -p 5206)
+[[ $? -eq 0 ]] && ok "v4->v6 iperf3 上传: $(grep -m1 sender <<<"$out" | awk '{print $7, $8}')" || bad "v4->v6 iperf3 上传失败: $(tail -3 <<<"$out")"
+nsx $C ip route get 10.10.1.1 | grep -q 'mtu 1380' \
+    && ok "v4->v6 客户端学到 PMTU 1380（ICMPv6 Packet Too Big 已转换为 ICMPv4 需要分片）" \
+    || bad "v4->v6 客户端未学到 PMTU 1380: $(nsx $C ip route get 10.10.1.1)"
+
+ip -n $C -6 route flush cache
+out=$(iperf_c -dst fd00:1::1 -p 5201)
+[[ $? -eq 0 ]] && ok "v6->v4 iperf3 上传: $(grep -m1 sender <<<"$out" | awk '{print $7, $8}')" || bad "v6->v4 iperf3 上传失败: $(tail -3 <<<"$out")"
+nsx $C ip -6 route get fd00:1::1 | grep -q 'mtu 1400' \
+    && ok "v6->v4 客户端学到 PMTU 1400（ICMPv4 需要分片已转换为 ICMPv6 Packet Too Big）" \
+    || bad "v6->v4 客户端未学到 PMTU 1400: $(nsx $C ip -6 route get fd00:1::1)"
+
+ip -n $C -6 route flush cache
+out=$(iperf_c -dst fd00:1::1 -p 5206)
+[[ $? -eq 0 ]] && ok "v6->v6 iperf3 上传: $(grep -m1 sender <<<"$out" | awk '{print $7, $8}')" || bad "v6->v6 iperf3 上传失败: $(tail -3 <<<"$out")"
+nsx $C ip -6 route get fd00:1::1 | grep -q 'mtu 1400' \
+    && ok "v6->v6 客户端学到 PMTU 1400（ICMPv6 Packet Too Big 转换成功）" \
+    || bad "v6->v6 客户端未学到 PMTU 1400: $(nsx $C ip -6 route get fd00:1::1)"
+ip -n $C route flush cache
+ip -n $C -6 route flush cache
+
+if [[ $WG == 1 ]]; then
+    out=$(nsx $C curl -s --max-time 8 http://10.10.1.1:7076/who)
+    [[ $out == srv-WG ]] && ok "v4->v6 经 WireGuard (L3) 返回 $out" || bad "v4->v6 WireGuard 返回 '$out'"
+    out=$(nsx $C curl -s --max-time 8 http://[fd00:1::1]:7070/who)
+    [[ $out == srv-WG ]] && ok "v6->v4 经 WireGuard (L3) 返回 $out" || bad "v6->v4 WireGuard 返回 '$out'"
+    out=$(nsx $C curl -s --max-time 8 http://[fd00:1::1]:7076/who)
+    [[ $out == srv-WG ]] && ok "v6->v6 经 WireGuard (L3) 返回 $out" || bad "v6->v6 WireGuard 返回 '$out'"
+fi
+
 step "域名解析变化（resolve_interval = 5 秒）"
 echo "10.10.3.3 srv.test" >/etc/netns/$R/hosts
 wait_until 15 grep -q 'ip = "10.10.3.3"' $ST
 out=$(nsx $C curl -s --max-time 5 http://10.10.1.1:9090/who)
 [[ $out == srv-B ]] && ok "域名改指 10.10.3.3 后新连接转发到 $out" || bad "解析变化后返回 '$out'"
 grep -q '解析变化: 10.10.3.2 -> 10.10.3.3' $W/daemon.log && ok "日志记录了解析变化" || bad "日志中没有解析变化"
+echo "fd00:3::3 srv.test" >/etc/netns/$R/hosts
+wait_until 15 grep -q 'ip = "fd00:3::3"' $ST
+out=$(nsx $C curl -s --max-time 5 http://10.10.1.1:9090/who)
+[[ $out == srv-B ]] && ok "域名改指 AAAA (fd00:3::3) 后 v4 客户端转发到 $out" || bad "AAAA 解析变化后返回 '$out'"
 
 step "连接表 / 状态"
 efw conns | tail -4
