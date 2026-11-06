@@ -534,15 +534,22 @@ HOLD_PID=$!
 wait_until 5 grep -q CONNECTED $W/hold.log || bad "重启前的 TCP 连接未建立: $(cat $W/hold.log)"
 efw conns | grep -q '10.10.1.1:8086 ' && ok "重启前的连接已在连接跟踪表中" || bad "连接跟踪表中没有 8086 的连接"
 kill -9 $DAEMON_PID; wait $DAEMON_PID 2>/dev/null; DAEMON_PID=
+LEFTOVER=0
 if nsx $R tc filter show dev r-cli ingress | grep -q fwd_eth; then
     ok "kill -9 后 netlink 挂载残留（内核 < 6.6 的预期行为）"
+    LEFTOVER=1
 else
     ok "kill -9 后无残留（TCX 挂载随进程自动释放）"
 fi
 rm -f $W/run/ebpf-forward.pid
 start_daemon || bad "重启后守护进程没有就绪"
-n=$(nsx $R tc filter show dev r-cli ingress | grep -c fwd_eth)
-[[ $n -eq 1 ]] && ok "重启后 r-cli 上只有 1 个 fwd_eth（残留已替换）" || bad "r-cli 上有 $n 个 fwd_eth"
+if [[ $LEFTOVER == 1 ]]; then
+    # TCX 挂载不会出现在 tc filter show 里，只有 netlink 方式才能这样数
+    n=$(nsx $R tc filter show dev r-cli ingress | grep -c fwd_eth)
+    [[ $n -eq 1 ]] && ok "重启后 r-cli 上只有 1 个 fwd_eth（残留已替换）" || bad "r-cli 上有 $n 个 fwd_eth"
+else
+    grep -A2 'name = "r-cli"' $ST | grep -q fwd_eth && ok "重启后 r-cli 重新挂载了 fwd_eth" || bad "重启后 r-cli 未挂载: $(grep -A2 name $ST | tr '\n' ' ')"
+fi
 touch $W/go
 wait $HOLD_PID
 out=$(tail -1 $W/hold.log)
