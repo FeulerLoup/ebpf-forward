@@ -22,6 +22,9 @@ BIN=$(readlink -f "${1:-$(dirname "$0")/../target/release/ebpf-forward}")
 MODE=${2:-partial}
 W=/tmp/efw-test
 ST=$W/run/status.toml
+# 连接跟踪表的固定目录：ip netns exec 会给进程换上新的 sysfs，/sys/fs/bpf 在里面不是 bpffs，
+# 所以在工作目录下单独挂一个 bpffs（新的挂载命名空间会继承它），也不会碰到本机正在运行的服务
+PIN=$W/bpf/efw-test
 C=efw-cli R=efw-relay T=efw-rt S=efw-srv G=efw-wg
 PASS=0 FAIL=0
 DAEMON_PID=
@@ -31,7 +34,7 @@ ok()   { printf '\033[32m[PASS]\033[0m %s\n' "$*"; PASS=$((PASS + 1)); }
 bad()  { printf '\033[31m[FAIL]\033[0m %s\n' "$*"; FAIL=$((FAIL + 1)); }
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 nsx()  { local ns=$1; shift; ip netns exec "$ns" "$@"; }
-efw()  { ip netns exec $R "$BIN" -c $W/config.toml --run-dir $W/run "$@"; }
+efw()  { ip netns exec $R "$BIN" -c $W/config.toml --run-dir $W/run --pin-dir $PIN "$@"; }
 # 后台运行测试用服务；disown 后，结束时被 kill -9 不会再打印 “Killed”
 svc()  { local log=$1; shift; nsx "$@" >"$log" 2>&1 & disown; }
 
@@ -52,7 +55,7 @@ daemon_ready() { grep -qx "pid = $DAEMON_PID" $ST 2>/dev/null && ! grep -q '^sta
 start_daemon() {
     # kill -9 留下的旧状态文件会让等待提前结束
     rm -f $ST
-    ip netns exec $R env RUST_LOG=info "$BIN" -c $W/config.toml --run-dir $W/run run >>$W/daemon.log 2>&1 &
+    ip netns exec $R env RUST_LOG=info "$BIN" -c $W/config.toml --run-dir $W/run --pin-dir $PIN run >>$W/daemon.log 2>&1 &
     DAEMON_PID=$!
     wait_until 15 daemon_ready
 }
@@ -102,6 +105,7 @@ cleanup() {
         ip netns del $ns 2>/dev/null
     done
     rm -rf /etc/netns/$R
+    umount $W/bpf 2>/dev/null
 }
 
 [[ $EUID -eq 0 ]] || { echo "需要 root"; exit 1; }
@@ -111,7 +115,8 @@ for c in ip tc ethtool curl iperf3 python3 tcpdump; do
 done
 trap cleanup EXIT
 cleanup
-rm -rf $W && mkdir -p $W/run $W/a $W/b $W/g $W/c
+rm -rf $W && mkdir -p $W/run $W/a $W/b $W/g $W/c $W/bpf
+mount -t bpf bpf $W/bpf || { echo "无法挂载 bpffs 到 $W/bpf"; exit 1; }
 
 step "搭建拓扑（模式: $MODE）"
 for ns in $C $R $T $S $G; do ip netns add $ns; ip -n $ns link set lo up; done
@@ -232,6 +237,28 @@ for _ in range(2):
     time.sleep(0.3)
 print(" ".join(out))
 EOF
+# 先建立 TCP 连接并报告，等出现“放行”文件后才发 HTTP 请求：用来验证连接跨越守护进程重启后仍然可用
+cat >$W/tcp_hold.py <<'EOF'
+import os, socket, sys, time
+s = socket.socket()
+s.settimeout(20)
+s.connect((sys.argv[1], int(sys.argv[2])))
+print("CONNECTED", flush=True)
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.2)
+s.sendall(b"GET /who HTTP/1.0\r\n\r\n")
+data = b""
+try:
+    while True:
+        d = s.recv(4096)
+        if not d:
+            break
+        data += d
+except OSError as e:
+    print("ERROR", e, flush=True)
+    sys.exit(1)
+print(data.decode(errors="replace").split("\r\n\r\n", 1)[-1].strip() or "EMPTY", flush=True)
+EOF
 echo srv-A >$W/a/who; echo srv-B >$W/b/who; echo srv-WG >$W/g/who; echo client-self >$W/c/who
 head -c 4194304 /dev/urandom >$W/a/big; cp $W/a/big $W/g/big
 head -c 262144 /dev/urandom >$W/a/mid
@@ -260,6 +287,8 @@ done
 step "启动守护进程并通过命令行添加规则"
 echo 'resolve_interval = 5' >$W/config.toml
 start_daemon && ok "守护进程已启动" || { bad "守护进程启动失败"; cat $W/daemon.log; exit 1; }
+grep -q "连接跟踪表已固定到 $PIN/CT" $W/daemon.log && [[ -e $PIN/CT ]] \
+    && ok "连接跟踪表已固定到 $PIN/CT" || bad "连接跟踪表未固定: $(grep -i '连接跟踪表' $W/daemon.log | tail -1)"
 {
     efw add 8080 10.10.3.2 80 -p tcp -y
     efw add 8086 fd00:3::2 80 -p tcp -y
@@ -485,25 +514,53 @@ step "停止守护进程后自动卸载"
 stop_daemon
 nsx $R tc filter show dev r-cli ingress | grep -q fwd_ && bad "停止后仍有 eBPF 挂载残留" || ok "停止后 eBPF 已从网卡卸载"
 [[ ! -f $W/run/status.toml && ! -f $W/run/ebpf-forward.pid ]] && ok "状态文件与 pid 文件已清理" || bad "状态文件/pid 文件残留"
+[[ -e $PIN/CT ]] && ok "停止后连接跟踪表仍固定在 $PIN/CT" || bad "停止后固定的连接跟踪表消失"
 
-step "异常退出（kill -9）后的恢复"
+step "修改 ct_max 后重启：重建连接跟踪表"
+sed -i 's/^ct_max = .*/ct_max = 2048/' $W/config.toml
 start_daemon || bad "守护进程启动失败"
+grep -q '连接跟踪表容量由 131072 改为 2048' $W/daemon.log && ok "日志记录了连接跟踪表重建" \
+    || bad "没有重建连接跟踪表: $(grep -i '连接跟踪表' $W/daemon.log | tail -1)"
+grep -qx 'ct_max = 2048' $ST && ok "状态文件中 ct_max = 2048" || bad "状态文件: $(grep ct_max $ST)"
+stop_daemon
+
+step "异常退出（kill -9）后的恢复：重启前的连接不中断"
+start_daemon || bad "守护进程启动失败"
+grep -q "复用已固定的连接跟踪表 $PIN/CT" $W/daemon.log && ok "重启后复用了固定的连接跟踪表" \
+    || bad "没有复用连接跟踪表: $(grep -i '连接跟踪表' $W/daemon.log | tail -1)"
+rm -f $W/go $W/hold.log
+nsx $C python3 $W/tcp_hold.py 10.10.1.1 8086 $W/go >$W/hold.log 2>&1 &
+HOLD_PID=$!
+wait_until 5 grep -q CONNECTED $W/hold.log || bad "重启前的 TCP 连接未建立: $(cat $W/hold.log)"
+efw conns | grep -q '10.10.1.1:8086 ' && ok "重启前的连接已在连接跟踪表中" || bad "连接跟踪表中没有 8086 的连接"
 kill -9 $DAEMON_PID; wait $DAEMON_PID 2>/dev/null; DAEMON_PID=
+LEFTOVER=0
 if nsx $R tc filter show dev r-cli ingress | grep -q fwd_eth; then
     ok "kill -9 后 netlink 挂载残留（内核 < 6.6 的预期行为）"
-    rm -f $W/run/ebpf-forward.pid
-    start_daemon || bad "重启后守护进程没有就绪"
-    n=$(nsx $R tc filter show dev r-cli ingress | grep -c fwd_eth)
-    [[ $n -eq 1 ]] && ok "重启后替换了残留挂载（r-cli 上只有 1 个 fwd_eth）" || bad "r-cli 上有 $n 个 fwd_eth"
-    out=$(nsx $C curl -s --max-time 5 http://10.10.1.1:9090/who)
-    [[ $out == srv-B ]] && ok "重启后转发正常" || bad "重启后转发返回 '$out'"
-    kill -9 $DAEMON_PID; wait $DAEMON_PID 2>/dev/null; DAEMON_PID=
-    rm -f $W/run/ebpf-forward.pid
-    efw cleanup >/dev/null
-    nsx $R tc filter show dev r-cli ingress | grep -q fwd_ && bad "cleanup 后仍有残留" || ok "ebpf-forward cleanup 清除了残留挂载"
+    LEFTOVER=1
 else
     ok "kill -9 后无残留（TCX 挂载随进程自动释放）"
 fi
+rm -f $W/run/ebpf-forward.pid
+start_daemon || bad "重启后守护进程没有就绪"
+if [[ $LEFTOVER == 1 ]]; then
+    # TCX 挂载不会出现在 tc filter show 里，只有 netlink 方式才能这样数
+    n=$(nsx $R tc filter show dev r-cli ingress | grep -c fwd_eth)
+    [[ $n -eq 1 ]] && ok "重启后 r-cli 上只有 1 个 fwd_eth（残留已替换）" || bad "r-cli 上有 $n 个 fwd_eth"
+else
+    grep -A2 'name = "r-cli"' $ST | grep -q fwd_eth && ok "重启后 r-cli 重新挂载了 fwd_eth" || bad "重启后 r-cli 未挂载: $(grep -A2 name $ST | tr '\n' ' ')"
+fi
+touch $W/go
+wait $HOLD_PID
+out=$(tail -1 $W/hold.log)
+[[ $out == srv-A ]] && ok "重启前建立的 TCP 连接在重启后继续可用（返回 $out）" || bad "重启前的连接在重启后不可用: '$out'"
+out=$(nsx $C curl -s --max-time 5 http://10.10.1.1:9090/who)
+[[ $out == srv-B ]] && ok "重启后新连接转发正常" || bad "重启后转发返回 '$out'"
+kill -9 $DAEMON_PID; wait $DAEMON_PID 2>/dev/null; DAEMON_PID=
+rm -f $W/run/ebpf-forward.pid
+efw cleanup >/dev/null
+nsx $R tc filter show dev r-cli ingress | grep -q fwd_ && bad "cleanup 后仍有残留挂载" || ok "cleanup 后没有残留挂载"
+[[ -e $PIN/CT ]] && bad "cleanup 后固定的连接跟踪表仍在" || ok "cleanup 删除了固定的连接跟踪表"
 
 echo
 grep -E 'WARN|ERROR' $W/daemon.log | grep -v 'ip_local_port_range' | head -5

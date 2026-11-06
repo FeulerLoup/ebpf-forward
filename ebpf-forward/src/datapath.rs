@@ -1,13 +1,18 @@
 use std::{
     collections::{BTreeMap, HashMap as StdHashMap, HashSet},
+    ffi::CString,
+    fs,
     hash::Hash,
+    mem::size_of,
     net::IpAddr,
+    os::unix::ffi::OsStrExt as _,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::{
     Ebpf, EbpfLoader, Pod,
-    maps::{Array, HashMap, Map, MapData, PerCpuArray},
+    maps::{Array, HashMap, Map, MapData, MapInfo, MapType, PerCpuArray},
     programs::{SchedClassifier, TcAttachType, tc, tc::SchedClassifierLinkId},
 };
 use ebpf_forward_common::*;
@@ -17,17 +22,24 @@ use crate::netinfo::{IfKind, Iface, ip_to_raw};
 
 pub const PROG_ETH: &str = "fwd_eth";
 pub const PROG_L3: &str = "fwd_l3";
+/// 连接跟踪表在 pin 目录下的文件名。
+pub const CT_PIN_NAME: &str = "CT";
 
 pub fn ebpf_object() -> &'static [u8] {
     aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/ebpf-forward"))
 }
 
 /// 加载 eBPF 对象并让内核 verifier 校验两个程序（不挂载）。
-pub fn load_object(ct_max: u32) -> Result<Ebpf> {
-    let mut ebpf = EbpfLoader::new()
-        .map_max_entries("CT", ct_max)
-        .load(ebpf_object())
-        .context("创建 eBPF map 失败")?;
+///
+/// `ct_pin` 指定连接跟踪表在 bpffs 上的固定路径：已存在时直接复用（里面的连接得以保留），
+/// 否则新建并固定；为 None 时连接跟踪表随进程销毁（`check` 试加载用这种方式，不碰守护进程的 pin）。
+pub fn load_object(ct_max: u32, ct_pin: Option<&Path>) -> Result<Ebpf> {
+    let mut loader = EbpfLoader::new();
+    loader.map_max_entries("CT", ct_max);
+    if let Some(p) = ct_pin {
+        loader.map_pin_path("CT", p.to_path_buf());
+    }
+    let mut ebpf = loader.load(ebpf_object()).context("创建 eBPF map 失败")?;
     for name in [PROG_ETH, PROG_L3] {
         let prog: &mut SchedClassifier = ebpf
             .program_mut(name)
@@ -38,6 +50,74 @@ pub fn load_object(ct_max: u32) -> Result<Ebpf> {
         })?;
     }
     Ok(ebpf)
+}
+
+fn is_bpffs(path: &Path) -> bool {
+    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0;
+    ok && st.f_type as u64 == libc::BPF_FS_MAGIC as u64
+}
+
+/// 准备连接跟踪表的固定路径：创建 pin 目录，已有的 pin 与当前配置 / 程序版本不符时删掉重建。
+/// bpffs 不可用时返回 None，连接跟踪表退回为随进程销毁。
+fn prepare_ct_pin(pin_dir: &Path, ct_max: u32) -> Option<PathBuf> {
+    if let Err(e) = fs::create_dir_all(pin_dir) {
+        warn!(
+            "无法创建 pin 目录 {}（{e}），连接跟踪表不会在重启后保留",
+            pin_dir.display()
+        );
+        return None;
+    }
+    if !is_bpffs(pin_dir) {
+        warn!(
+            "{} 不在 bpffs 上（未挂载 /sys/fs/bpf？），连接跟踪表不会在重启后保留",
+            pin_dir.display()
+        );
+        return None;
+    }
+    let path = pin_dir.join(CT_PIN_NAME);
+    if !path.exists() {
+        return Some(path);
+    }
+    match MapInfo::from_pin(&path) {
+        Ok(info)
+            if matches!(info.map_type(), Ok(MapType::LruHash))
+                && info.key_size() == size_of::<CtKey>() as u32
+                && info.value_size() == size_of::<CtValue>() as u32 =>
+        {
+            if info.max_entries() == ct_max {
+                return Some(path);
+            }
+            info!(
+                "连接跟踪表容量由 {} 改为 {ct_max}，重建连接跟踪表（已有连接会中断）",
+                info.max_entries()
+            );
+        }
+        Ok(_) => info!("已固定的连接跟踪表与当前程序版本不兼容，重建连接跟踪表（已有连接会中断）"),
+        Err(e) => warn!("无法打开已固定的连接跟踪表 {}（{e}），重建", path.display()),
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            warn!(
+                "删除旧的连接跟踪表 {} 失败（{e}），连接跟踪表不会在重启后保留",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// 删除 pin 目录（固定的连接跟踪表随之销毁）；返回是否确实删除了东西。
+pub fn remove_pins(pin_dir: &Path) -> Result<bool> {
+    if !pin_dir.exists() {
+        return Ok(false);
+    }
+    fs::remove_dir_all(pin_dir).with_context(|| format!("删除 {} 失败", pin_dir.display()))?;
+    Ok(true)
 }
 
 struct Attached {
@@ -88,9 +168,26 @@ where
 }
 
 impl Datapath {
-    pub fn load(ct_max: u32) -> Result<Self> {
-        let mut ebpf = load_object(ct_max)?;
-        let (ct, ct_map_id) = take(&mut ebpf, "CT")?;
+    /// `pin_dir` 为 Some 时把连接跟踪表固定到 `pin_dir/CT`，重启守护进程时复用其中的连接。
+    pub fn load(ct_max: u32, pin_dir: Option<&Path>) -> Result<Self> {
+        let ct_pin = pin_dir.and_then(|d| prepare_ct_pin(d, ct_max));
+        let restored = ct_pin.as_deref().is_some_and(Path::exists);
+        let mut ebpf = load_object(ct_max, ct_pin.as_deref())?;
+        let (ct, ct_map_id): (HashMap<MapData, CtKey, CtValue>, _) = take(&mut ebpf, "CT")?;
+        if let Some(p) = &ct_pin {
+            if restored {
+                let n = ct.keys().filter_map(Result::ok).count();
+                info!(
+                    "复用已固定的连接跟踪表 {}（{n} 项），重启前的连接继续转发",
+                    p.display()
+                );
+            } else {
+                info!(
+                    "连接跟踪表已固定到 {}，重启服务时会保留已有连接",
+                    p.display()
+                );
+            }
+        }
         let (_, stats_map_id): (PerCpuArray<MapData, u64>, _) = take(&mut ebpf, "STATS")?;
         Ok(Self {
             rules: take(&mut ebpf, "RULES")?.0,
