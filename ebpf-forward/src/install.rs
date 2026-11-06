@@ -60,7 +60,7 @@ pub fn install(paths: &Paths) -> Result<()> {
     println!();
 
     bump_memlock_rlimit();
-    if let Err(e) = datapath::load_object(4096) {
+    if let Err(e) = datapath::load_object(4096, None) {
         manage::err(&format!("当前内核无法加载 eBPF 程序: {e:#}"));
         println!("\n{UPGRADE_GUIDE}");
         bail!("内核不支持，已中止安装");

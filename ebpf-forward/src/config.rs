@@ -14,6 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const DEFAULT_CONFIG: &str = "/etc/ebpf-forward/config.toml";
 pub const DEFAULT_RUN_DIR: &str = "/run/ebpf-forward";
+pub const DEFAULT_PIN_DIR: &str = "/sys/fs/bpf/ebpf-forward";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Proto {
@@ -133,7 +134,7 @@ const HEADER: &str = "\
 # interfaces         挂载 eBPF 的网卡，留空 = 自动（所有已启用且有 IP 地址的网卡）
 # snat_port_min/max  SNAT 源端口范围，应避开 net.ipv4.ip_local_port_range
 # mss_clamp          对 SYN 做 MSS 钳制，出口 MTU 较小（如 WireGuard）时避免大包被丢弃
-# ct_max             连接跟踪表容量（每条连接占 2 项，修改后需重启服务）
+# ct_max             连接跟踪表容量（每条连接占 2 项，修改后需重启服务，重启时重建连接跟踪表、已有连接会中断）
 # tcp_timeout        TCP 连接空闲超时（秒）
 # udp_timeout        UDP 会话空闲超时（秒）
 #

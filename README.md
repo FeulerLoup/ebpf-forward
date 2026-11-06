@@ -28,6 +28,7 @@
 - **L**：客户端访问的本机地址；**S**：本机去往目标时的出口地址（自动获取，相当于 nftables 规则里 `snat to` 后面的本机 IP）
 - **np**：从 SNAT 端口范围中分配，优先沿用客户端的源端口
 - 每条连接在连接跟踪表里占两项（原方向、回复方向），守护进程按 TCP 状态和空闲时间回收
+- 连接跟踪表固定在 bpffs 上（`/sys/fs/bpf/ebpf-forward/CT`），重启或升级服务时沿用，已有连接不会中断
 
 ## 系统要求
 
@@ -132,11 +133,11 @@ sudo ebpf-forward check                                # 内核支持检查 + �
 | `conns` | 查看连接跟踪表 |
 | `status` | 守护进程状态、挂载的网卡、转发与丢包统计 |
 | `check` | 内核支持检查与运行环境诊断 |
-| `install` / `uninstall [--purge]` | 安装 / 卸载 systemd 服务（`--purge` 同时删除配置和程序） |
-| `cleanup` | 卸载网卡上残留的 eBPF 挂载 |
+| `install` / `uninstall [--purge]` | 安装 / 卸载 systemd 服务（卸载时一并删除固定的连接跟踪表；`--purge` 同时删除配置和程序） |
+| `cleanup` | 卸载网卡上残留的 eBPF 挂载，并删除固定的连接跟踪表（已有连接会中断） |
 | `menu` | 交互式菜单（不带子命令运行时默认进入） |
 
-全局参数：`-c, --config <文件>`（默认 `/etc/ebpf-forward/config.toml`）、`--run-dir <目录>`（默认 `/run/ebpf-forward`）。
+全局参数：`-c, --config <文件>`（默认 `/etc/ebpf-forward/config.toml`）、`--run-dir <目录>`（默认 `/run/ebpf-forward`）、`--pin-dir <目录>`（连接跟踪表在 bpffs 上的固定目录，默认 `/sys/fs/bpf/ebpf-forward`）。
 
 通过命令行增删规则后，程序会通知守护进程立即重新加载，等它应用完成（包括域名解析）再显示结果。
 
@@ -174,7 +175,7 @@ proto = "udp"
 | `interfaces` | `[]` | 挂载 eBPF 的网卡。留空时自动选择：所有已启用且有 IP 地址的网卡，加上去往各目标的出口网卡；网卡增删后自动重新挂载 |
 | `snat_port_min` / `snat_port_max` | 10000 / 32767 | SNAT 源端口范围，应避开 `net.ipv4.ip_local_port_range`（默认 32768-60999） |
 | `mss_clamp` | true | 把 SYN / SYN-ACK 的 MSS 钳制到 min(入口 MTU, 出口 MTU) - (纯 v4 为 40，含 v6 为 60) |
-| `ct_max` | 131072 | 连接跟踪表容量，每条连接占 2 项（默认约 6.5 万条连接，满了按 LRU 淘汰）。修改后需重启服务 |
+| `ct_max` | 131072 | 连接跟踪表容量，每条连接占 2 项（默认约 6.5 万条连接，满了按 LRU 淘汰）。修改后需重启服务，重启时会按新容量重建连接跟踪表，已有连接会中断 |
 | `tcp_timeout` | 86400 | TCP 已建立连接的空闲超时（秒） |
 | `udp_timeout` | 120 | 有回包的 UDP 会话空闲超时（秒）；没有回包的 30 秒回收 |
 
@@ -206,6 +207,7 @@ TCP 的其余超时参照 Linux conntrack：收到 RST 后 10 秒，双方都发
 - 目标不能是本机地址或链路本地地址（`fe80::/10`）
 - 只转发发往本机地址的报文，不会影响路过本机（路由转发）的流量；本机自己访问 `127.0.0.1:端口` / `[::1]:端口` 也不会被转发（与 nftables 的 prerouting DNAT 一致）
 - 删除规则后，该规则已有的连接会在 10 秒内断开
+- 重启或升级服务（`systemctl restart ebpf-forward`、重新 `install`）不会中断已有连接：连接跟踪表固定在 bpffs 上，新进程直接沿用。只有执行 `cleanup`、`uninstall`、修改 `ct_max` 或重启系统时连接跟踪表才会清空
 
 ## 排错
 
@@ -215,7 +217,8 @@ TCP 的其余超时参照 Linux conntrack：收到 RST 后 10 秒，双方都发
   - **无路由/未开启转发**：检查 `sysctl net.ipv4.ip_forward`（应为 1）以及去往目标的路由
   - **超过出口 MTU**：非 TCP 的大包超过出口网卡 MTU；TCP 由 MSS 钳制处理
   - **SNAT 端口耗尽**：同一目标的并发连接过多，可扩大 SNAT 端口范围
-- 内核 < 6.6 时，守护进程如果被 `kill -9`，网卡上会残留 eBPF 挂载（继续按旧规则转发）。重启服务会自动替换残留，也可以停止服务后执行 `ebpf-forward cleanup`
+- 内核 < 6.6 时，守护进程如果被 `kill -9`，网卡上会残留 eBPF 挂载（继续按旧规则转发）。重启服务会自动替换残留（已有连接不受影响），也可以停止服务后执行 `ebpf-forward cleanup`（会一并删除连接跟踪表）
+- 重启服务后已有连接断开：查看日志是否有“连接跟踪表不会在重启后保留”的警告，通常是 `/sys/fs/bpf` 没有挂载 bpffs（`mount -t bpf bpf /sys/fs/bpf`，systemd 系统默认已挂载）。`ebpf-forward check` 会显示连接跟踪表是否已固定；`bpftool map show pinned /sys/fs/bpf/ebpf-forward/CT` 可直接查看
 - 也可以直接查看内核里的对象：`bpftool net show`、`tc filter show dev eth0 ingress`
 
 ## 开发
@@ -253,7 +256,7 @@ sudo LONG=1 scripts/netns-test.sh $BIN partial   # 额外验证超时回收（�
 - MSS 钳制
 - WireGuard 等 L3 网卡
 - 同网卡回环、源端口复用
-- 删除规则、连接回收、退出卸载与异常退出后的恢复
+- 删除规则、连接回收、退出卸载、异常退出后的恢复，以及重启前建立的连接在重启后继续可用、修改 `ct_max` 后重建连接跟踪表
 
 两种模式分别验证 CHECKSUM_PARTIAL（GSO）报文和完整校验和报文，并用 tcpdump 独立重新计算校验和。测试只操作新建的 namespace，不影响本机网络。
 
