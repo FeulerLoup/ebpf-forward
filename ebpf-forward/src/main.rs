@@ -13,7 +13,7 @@ use std::{io::IsTerminal as _, path::PathBuf, process::ExitCode};
 use clap::{CommandFactory as _, Parser, Subcommand};
 
 use crate::{
-    config::{DEFAULT_CONFIG, DEFAULT_RUN_DIR, Proto, Rule},
+    config::{DEFAULT_CONFIG, DEFAULT_PIN_DIR, DEFAULT_RUN_DIR, Proto, Rule},
     status::Paths,
 };
 
@@ -29,6 +29,9 @@ struct Cli {
     /// 运行目录（pid 与状态文件）
     #[arg(long, global = true, default_value = DEFAULT_RUN_DIR)]
     run_dir: PathBuf,
+    /// 连接跟踪表在 bpffs 上的固定目录（重启服务时保留已有连接）
+    #[arg(long, global = true, default_value = DEFAULT_PIN_DIR)]
+    pin_dir: PathBuf,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -88,7 +91,7 @@ enum Cmd {
         #[arg(long)]
         purge: bool,
     },
-    /// 卸载网卡上残留的 eBPF 挂载（守护进程异常退出后使用）
+    /// 卸载网卡上残留的 eBPF 挂载并删除固定的连接跟踪表（守护进程异常退出后使用）
     Cleanup {
         #[arg(long)]
         force: bool,
@@ -102,6 +105,7 @@ fn main() -> ExitCode {
     let paths = Paths {
         config: cli.config,
         run_dir: cli.run_dir,
+        pin_dir: cli.pin_dir,
     };
     let is_daemon = matches!(cli.cmd, Some(Cmd::Run));
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

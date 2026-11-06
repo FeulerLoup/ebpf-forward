@@ -423,7 +423,8 @@ pub fn systemctl_state() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// 卸载所有网卡上残留的本程序 TC 过滤器（netlink 方式挂载时异常退出可能残留）。
+/// 卸载所有网卡上残留的本程序 TC 过滤器（netlink 方式挂载时异常退出可能残留），
+/// 并删除固定在 bpffs 上的连接跟踪表。
 pub fn cleanup(paths: &Paths, force: bool) -> Result<()> {
     require_root()?;
     if status::daemon_pid(paths).is_some() && !force {
@@ -440,6 +441,14 @@ pub fn cleanup(paths: &Paths, force: bool) -> Result<()> {
     }
     if n == 0 {
         info("没有发现残留的 eBPF 挂载。");
+    }
+    match datapath::remove_pins(&paths.pin_dir) {
+        Ok(true) => info(&format!(
+            "已删除固定的连接跟踪表 {}（已有连接会中断）。",
+            paths.pin_dir.display()
+        )),
+        Ok(false) => {}
+        Err(e) => warn(&format!("{e:#}")),
     }
     Ok(())
 }

@@ -200,7 +200,7 @@ pub fn check(paths: &Paths) -> Result<bool> {
 
     if unsafe { libc::geteuid() } == 0 {
         bump_memlock_rlimit();
-        match datapath::load_object(4096) {
+        match datapath::load_object(4096, None) {
             Ok(_) => info("试加载 eBPF 程序: 成功（内核 verifier 校验通过）"),
             Err(e) => {
                 err(&format!("试加载 eBPF 程序失败: {e:#}"));
@@ -261,6 +261,18 @@ fn diagnose(paths: &Paths) {
                 st.rules.len(),
                 st.conns
             ));
+            let pin = paths.ct_pin();
+            if pin.exists() {
+                info(&format!(
+                    "连接跟踪表已固定在 {}（重启服务时保留已有连接）",
+                    pin.display()
+                ));
+            } else {
+                warn(&format!(
+                    "连接跟踪表未固定到 {}（bpffs 未挂载？），重启服务会中断已有连接",
+                    pin.display()
+                ));
+            }
             for r in st.rules.iter().filter(|r| r.state != "ok") {
                 warn(&format!(
                     "规则 {}/{} -> {} 未生效: {}",

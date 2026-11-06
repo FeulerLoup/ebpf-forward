@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct Paths {
     pub config: PathBuf,
     pub run_dir: PathBuf,
+    /// bpffs 上固定连接跟踪表的目录
+    pub pin_dir: PathBuf,
 }
 
 impl Paths {
@@ -19,6 +21,10 @@ impl Paths {
 
     pub fn pid_file(&self) -> PathBuf {
         self.run_dir.join("ebpf-forward.pid")
+    }
+
+    pub fn ct_pin(&self) -> PathBuf {
+        self.pin_dir.join(crate::datapath::CT_PIN_NAME)
     }
 }
 

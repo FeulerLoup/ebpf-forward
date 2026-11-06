@@ -195,7 +195,7 @@ pub fn run(paths: Paths) -> Result<()> {
         Err(e) => warn!("开启 net.ipv6.conf.all.forwarding 失败: {e}，IPv6 转发将无法工作"),
     }
 
-    let dp = Datapath::load(cfg.ct_max)?;
+    let dp = Datapath::load(cfg.ct_max, Some(&paths.pin_dir))?;
     info!(
         "eBPF 已加载（内核 {}，连接跟踪表 {} 项），共 {} 条规则",
         kernel_release(),
@@ -269,7 +269,9 @@ impl Daemon {
         match Config::load(&self.paths.config) {
             Ok(mut cfg) => {
                 if cfg.ct_max != self.cfg.ct_max {
-                    warn!("ct_max 的修改需要重启服务才能生效");
+                    warn!(
+                        "ct_max 的修改需要重启服务才能生效（重启时会重建连接跟踪表，已有连接会中断）"
+                    );
                     cfg.ct_max = self.cfg.ct_max;
                 }
                 if cfg != self.cfg {
