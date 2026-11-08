@@ -17,6 +17,10 @@
 #   full     客户端/目标机关闭校验和卸载（报文带完整校验和）—— 验证完整的增量校验和
 #
 set -u
+# 测试流量只在本机的 network namespace 之间走。继承来的 HTTP 代理（例如 lima 把宿主机代理写进
+# /etc/environment，Ubuntu 的 sudo-rs 经 pam_env 带给 root）会让 curl 去连 namespace 里不可达的代理，
+# 报文根本到不了转发机，看起来就像 eBPF 程序没生效
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 BIN=$(readlink -f "${1:-$(dirname "$0")/../target/release/ebpf-forward}")
 MODE=${2:-partial}
