@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::{
     check::UPGRADE_GUIDE,
-    config::{Config, DEFAULT_CONFIG},
+    config::{Config, DEFAULT_CONFIG, DEFAULT_RUN_DIR},
     daemon::bump_memlock_rlimit,
     datapath,
     manage::{self, info, require_root, warn},
@@ -32,6 +32,9 @@ fn unit_file(paths: &Paths) -> String {
     if paths.config != Path::new(DEFAULT_CONFIG) {
         exec += &format!(" --config {}", paths.config.display());
     }
+    if paths.run_dir != Path::new(DEFAULT_RUN_DIR) {
+        exec += &format!(" --run-dir {}", paths.run_dir.display());
+    }
     format!(
         "\
 [Unit]
@@ -39,6 +42,8 @@ Description=eBPF port forwarding (DNAT/SNAT)
 Documentation=man:tc-bpf(8)
 After=network-online.target
 Wants=network-online.target
+# 不限制重启次数：短时间内多次失败（如网络尚未就绪）也要持续重试，不能永久停掉
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -126,9 +131,14 @@ pub fn uninstall(paths: &Paths, purge: bool) -> Result<()> {
     let _ = manage::cleanup(paths, true);
     fs::remove_file(SYSCTL_CONF).ok();
     if purge {
+        // 只删自己的文件，目录只在空了之后删除（用户用 -c / --run-dir 指到 /etc、/tmp 这类目录时不能整个删掉）
+        fs::remove_file(&paths.config).ok();
         if let Some(dir) = paths.config.parent() {
-            fs::remove_dir_all(dir).ok();
+            fs::remove_dir(dir).ok();
         }
+        fs::remove_file(paths.status_file()).ok();
+        fs::remove_file(paths.pid_file()).ok();
+        fs::remove_dir(&paths.run_dir).ok();
         fs::remove_file(BIN_PATH).ok();
         info("已删除配置和程序文件。");
     } else {

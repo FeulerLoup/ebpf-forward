@@ -119,18 +119,47 @@ pub fn check_port_conflict(port: u16, proto: Proto) -> bool {
     confirm("是否仍要继续添加转发规则？", false)
 }
 
+/// 从规则列表中删除本机端口 `port` 的规则，返回删除的条数。
+/// 指定 `proto` 时只删除该协议：tcp+udp 的规则会保留另一种协议。
+pub fn remove_rules(rules: &mut Vec<Rule>, port: u16, proto: Option<Proto>) -> usize {
+    let mut removed = 0;
+    let mut kept = Vec::with_capacity(rules.len());
+    for r in rules.drain(..) {
+        if r.listen_port != port || proto.is_some_and(|p| !p.overlaps(r.proto)) {
+            kept.push(r);
+            continue;
+        }
+        removed += 1;
+        let remain = match (proto, r.proto) {
+            (Some(Proto::Tcp), Proto::Both) => Some(Proto::Udp),
+            (Some(Proto::Udp), Proto::Both) => Some(Proto::Tcp),
+            _ => None,
+        };
+        if let Some(p) = remain {
+            kept.push(Rule { proto: p, ..r });
+        }
+    }
+    *rules = kept;
+    removed
+}
+
 pub fn del(paths: &Paths, port: u16, proto: Option<Proto>) -> Result<()> {
     require_root()?;
     let mut cfg = Config::load(&paths.config)?;
-    let before = cfg.rules.len();
-    cfg.rules
-        .retain(|r| !(r.listen_port == port && proto.is_none_or(|p| p.overlaps(r.proto))));
-    if cfg.rules.len() == before {
-        bail!("没有本机端口 {port} 的转发规则");
+    let removed = remove_rules(&mut cfg.rules, port, proto);
+    if removed == 0 {
+        match proto {
+            Some(p) => bail!("没有本机端口 {port} ({p}) 的转发规则"),
+            None => bail!("没有本机端口 {port} 的转发规则"),
+        }
     }
     cfg.save(&paths.config)?;
+    let what = match proto {
+        Some(p) => format!("本机端口 {port} ({p})"),
+        None => format!("本机端口 {port}"),
+    };
     info(&format!(
-        "已删除本机端口 {port} 的转发规则（已有连接会在 10 秒内断开）"
+        "已删除 {what} 的转发规则（已有连接会在 10 秒内断开）"
     ));
     notify_and_wait(paths);
     Ok(())
@@ -398,6 +427,7 @@ pub fn status(paths: &Paths) -> Result<()> {
                     (STAT_FRAG_NEEDED, "超过出口 MTU"),
                     (STAT_TTL_EXCEEDED, "TTL 耗尽"),
                     (STAT_REDIRECT_FAIL, "重定向失败"),
+                    (STAT_UDP_NOCSUM, "IPv4 UDP 无校验和（无法转为 IPv6）"),
                 ];
                 let d: Vec<String> = drops
                     .iter()
@@ -451,4 +481,40 @@ pub fn cleanup(paths: &Paths, force: bool) -> Result<()> {
         Err(e) => warn(&format!("{e:#}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(port: u16, proto: Proto) -> Rule {
+        Rule {
+            listen_port: port,
+            target: "1.2.3.4".into(),
+            target_port: port,
+            proto,
+            snat_ip: None,
+            comment: String::new(),
+        }
+    }
+
+    #[test]
+    fn del_keeps_other_protocol() {
+        let mut rules = vec![rule(80, Proto::Both), rule(81, Proto::Tcp)];
+        assert_eq!(remove_rules(&mut rules, 80, Some(Proto::Tcp)), 1);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].proto, Proto::Udp);
+
+        assert_eq!(remove_rules(&mut rules, 80, Some(Proto::Tcp)), 0);
+        assert_eq!(remove_rules(&mut rules, 80, Some(Proto::Udp)), 1);
+        assert_eq!(rules.len(), 1);
+
+        assert_eq!(remove_rules(&mut rules, 81, Some(Proto::Udp)), 0);
+        assert_eq!(remove_rules(&mut rules, 81, None), 1);
+        assert!(rules.is_empty());
+
+        let mut rules = vec![rule(80, Proto::Tcp), rule(80, Proto::Udp)];
+        assert_eq!(remove_rules(&mut rules, 80, Some(Proto::Both)), 2);
+        assert!(rules.is_empty());
+    }
 }

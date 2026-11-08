@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::fd::AsRawFd as _,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -105,19 +106,23 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// 守护进程是否在运行（读取 pid 文件并探测进程；普通用户探测 root 进程会得到 EPERM）。
+/// 守护进程是否在运行，运行中返回其 pid。
+///
+/// 守护进程启动时对 pid 文件加 flock 并一直持有，这里尝试加锁：加不上说明守护进程仍在运行。
+/// 相比 `kill(pid, 0)`，进程崩溃后残留的 pid 文件不会因为 pid 被其他进程复用而误判，
+/// 也就不会把 SIGHUP 发给无关进程。
 pub fn daemon_pid(paths: &Paths) -> Option<i32> {
-    let pid: i32 = fs::read_to_string(paths.pid_file())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if pid <= 0 {
+    let path = paths.pid_file();
+    let f = fs::File::open(&path).ok()?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // 加锁成功：没有守护进程持有它（f 析构时自动释放）
         return None;
     }
-    let alive = unsafe { libc::kill(pid, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    alive.then_some(pid)
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return None;
+    }
+    let pid: i32 = fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    (pid > 0).then_some(pid)
 }
 
 pub fn fmt_ago(ts: u64) -> String {

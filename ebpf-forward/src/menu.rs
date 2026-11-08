@@ -29,7 +29,16 @@ fn add(paths: &Paths) -> Result<()> {
     let Some(lport) = read_port("请输入本机监听端口 (1-65535): ", None) else {
         return Ok(());
     };
-    if let Some(r) = cfg.rules.iter().find(|r| r.listen_port == lport) {
+    let same_port: Vec<&Rule> = cfg
+        .rules
+        .iter()
+        .filter(|r| r.listen_port == lport)
+        .collect();
+    if same_port
+        .iter()
+        .all(|r| r.proto.overlaps(Proto::Tcp) && r.proto.overlaps(Proto::Udp))
+        && let Some(r) = same_port.first()
+    {
         err(&format!(
             "本机端口 {lport} 已存在转发规则 -> {}，请先删除后再添加。",
             fmt_host_port(&r.target, r.target_port)
@@ -56,6 +65,14 @@ fn add(paths: &Paths) -> Result<()> {
         Some("3") => Proto::Udp,
         _ => Proto::Both,
     };
+    if let Some(r) = same_port.iter().find(|r| r.proto.overlaps(proto)) {
+        err(&format!(
+            "本机端口 {lport} ({}) 已存在转发规则 -> {}，请先删除后再添加。",
+            r.proto,
+            fmt_host_port(&r.target, r.target_port)
+        ));
+        return Ok(());
+    }
     if !manage::check_port_conflict(lport, proto) {
         info("已取消。");
         return Ok(());

@@ -304,7 +304,12 @@ fn handle_l4(ctx: &TcContext, s: &mut Scratch, l3_off: usize, l4_off: usize) -> 
     let now = unsafe { bpf_ktime_get_ns() };
 
     match ct_lookup(s, tcp_flags, pure_syn, now) {
-        Lookup::Hit => {}
+        Lookup::Hit => {
+            if s.l3.ttl <= 1 {
+                stat_add(STAT_TTL_EXCEEDED, 1);
+                return SHOT;
+            }
+        }
         miss => {
             let avoid = match miss {
                 Lookup::Reopen(port) => port,
@@ -316,11 +321,6 @@ fn handle_l4(ctx: &TcContext, s: &mut Scratch, l3_off: usize, l4_off: usize) -> 
                 Err(()) => return SHOT,
             }
         }
-    }
-
-    if s.l3.ttl <= 1 {
-        stat_add(STAT_TTL_EXCEEDED, 1);
-        return SHOT;
     }
 
     if ensure_eth_head(ctx, l3_off, s.l3.family).is_err() {
@@ -457,6 +457,11 @@ fn ct_create(s: &mut Scratch, pure_syn: bool, now: u64, avoid: u16) -> Result<bo
     };
     if unsafe { LOCAL_ADDRS.get(&s.lk) }.is_none() {
         return Ok(false);
+    }
+    // 报文归本程序处理但 TTL 已耗尽：直接丢弃，不为它建立连接跟踪项
+    if s.l3.ttl <= 1 {
+        stat_add(STAT_TTL_EXCEEDED, 1);
+        return Err(());
     }
 
     let (pmin, pmax) = match CONFIG.get(0) {
@@ -635,6 +640,11 @@ fn rewrite_l4(ctx: &TcContext, s: &mut Scratch, ports: &Ports) -> Result<usize, 
         }
         (AF_INET, AF_INET6) => {
             if l3.ihl as usize != IPV4_HLEN {
+                return Err(-1);
+            }
+            // IPv4 允许 UDP 不带校验和（字段为 0），IPv6 不允许；增量更新无法凭空算出完整校验和，丢弃
+            if l3.proto == PROTO_UDP && ctx.load::<u16>(ETH_HLEN + IPV4_HLEN + 6)? == 0 {
+                stat_add(STAT_UDP_NOCSUM, 1);
                 return Err(-1);
             }
             ctx.change_proto(ETH_P_IPV6.to_be(), 0)?;
@@ -897,6 +907,10 @@ fn handle_icmp4(ctx: &TcContext, s: &mut Scratch, l3_off: usize, l4_off: usize) 
     s.xlate = *e;
     if s.ip4.ttl <= 1 {
         return SHOT;
+    }
+    // 转换为 ICMPv6 时按 20 字节 IPv4 头改写报文，带 IP 选项的外层报文不处理
+    if s.xlate.family == AF_INET6 && l4_off - l3_off != IPV4_HLEN {
+        return PASS;
     }
 
     let delta = if l3_off == 0 { ETH_HLEN } else { 0 };

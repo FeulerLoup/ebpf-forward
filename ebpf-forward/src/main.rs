@@ -108,9 +108,14 @@ fn main() -> ExitCode {
         pin_dir: cli.pin_dir,
     };
     let is_daemon = matches!(cli.cmd, Some(Cmd::Run));
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_target(false)
-        .init();
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    logger.format_target(false);
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        // 输出已接入 journald，由它记录时间，避免每行两个时间戳
+        logger.format_timestamp(None);
+    }
+    logger.init();
 
     let res = match cli.cmd {
         Some(Cmd::Run) => daemon::run(paths),

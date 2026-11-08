@@ -133,6 +133,8 @@ pub const STAT_ICMP_XLATE: u32 = 10;
 pub const STAT_REDIRECT_NEIGH: u32 = 11;
 pub const STAT_MSS_CLAMPED: u32 = 12;
 pub const STAT_REDIRECT_FAIL: u32 = 13;
+/// IPv4 UDP 报文没有校验和（校验和字段为 0），无法转换为 IPv6（IPv6 要求 UDP 必须带校验和）。
+pub const STAT_UDP_NOCSUM: u32 = 14;
 pub const STAT_MAX: u32 = 16;
 
 #[cfg(feature = "user")]

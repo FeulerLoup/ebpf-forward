@@ -3,7 +3,7 @@ use std::{
     fs,
     io::Write as _,
     net::{IpAddr, ToSocketAddrs},
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::PermissionsExt as _},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -66,6 +66,8 @@ impl PidLock {
         }
         f.set_len(0)?;
         writeln!(f, "{}", std::process::id())?;
+        // 普通用户执行 list 时也要能打开它探测守护进程是否在运行
+        let _ = f.set_permissions(fs::Permissions::from_mode(0o644));
         Ok(Self { _file: f, path })
     }
 }

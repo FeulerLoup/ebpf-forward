@@ -127,13 +127,13 @@ sudo ebpf-forward check                                # 内核支持检查 + �
 |---|---|
 | `run` | 前台运行守护进程（systemd 服务执行的就是它） |
 | `add <本机端口> <目标> [目标端口]` | 新增规则。`-p tcp\|udp\|tcp+udp`（默认 tcp+udp）、`--snat-ip` 手动指定 SNAT 源地址、`--comment` 备注、`-y` 端口被本地服务占用时不再询问 |
-| `del <本机端口>` | 删除规则，`-p` 只删除指定协议 |
+| `del <本机端口>` | 删除规则，`-p` 只删除指定协议（`tcp+udp` 的规则会保留另一种协议） |
 | `list` | 查看规则与生效状态 |
 | `clear` | 清空规则（`-y` 跳过确认） |
 | `conns` | 查看连接跟踪表 |
 | `status` | 守护进程状态、挂载的网卡、转发与丢包统计 |
 | `check` | 内核支持检查与运行环境诊断 |
-| `install` / `uninstall [--purge]` | 安装 / 卸载 systemd 服务（卸载时一并删除固定的连接跟踪表；`--purge` 同时删除配置和程序） |
+| `install` / `uninstall [--purge]` | 安装 / 卸载 systemd 服务（卸载时一并删除固定的连接跟踪表；`--purge` 同时删除配置文件、运行目录和程序） |
 | `cleanup` | 卸载网卡上残留的 eBPF 挂载，并删除固定的连接跟踪表（已有连接会中断） |
 | `menu` | 交互式菜单（不带子命令运行时默认进入） |
 
@@ -204,6 +204,7 @@ TCP 的其余超时参照 Linux conntrack：收到 RST 后 10 秒，双方都发
 - 同一端口如果在 nftables 里也有 DNAT 规则，由 eBPF 优先处理，nftables 的规则不再生效；`ebpf-forward check` 会列出冲突的端口
 - 支持 IPv4 / IPv6 任意组合转发（v4→v4、v6→v6、v4→v6、v6→v4）；只支持单个端口，不支持端口段
 - 不转发 IP 分片报文：超过 MTU 的大 UDP 包会受影响，TCP 不受影响
+- v4→v6 转发时，不带校验和的 IPv4 UDP 报文（校验和字段为 0，IPv6 不允许）会被丢弃并计入 `status` 的丢包统计；常见协议栈都会带校验和，一般不会遇到
 - 目标不能是本机地址或链路本地地址（`fe80::/10`）
 - 只转发发往本机地址的报文，不会影响路过本机（路由转发）的流量；本机自己访问 `127.0.0.1:端口` / `[::1]:端口` 也不会被转发（与 nftables 的 prerouting DNAT 一致）
 - 删除规则后，该规则已有的连接会在 10 秒内断开
@@ -217,6 +218,7 @@ TCP 的其余超时参照 Linux conntrack：收到 RST 后 10 秒，双方都发
   - **无路由/未开启转发**：检查 `sysctl net.ipv4.ip_forward`（应为 1）以及去往目标的路由
   - **超过出口 MTU**：非 TCP 的大包超过出口网卡 MTU；TCP 由 MSS 钳制处理
   - **SNAT 端口耗尽**：同一目标的并发连接过多，可扩大 SNAT 端口范围
+  - **IPv4 UDP 无校验和**：v4→v6 规则收到了不带校验和的 IPv4 UDP 报文，IPv6 要求 UDP 必须有校验和，无法转换
 - 内核 < 6.6 时，守护进程如果被 `kill -9`，网卡上会残留 eBPF 挂载（继续按旧规则转发）。重启服务会自动替换残留（已有连接不受影响），也可以停止服务后执行 `ebpf-forward cleanup`（会一并删除连接跟踪表）
 - 重启服务后已有连接断开：查看日志是否有“连接跟踪表不会在重启后保留”的警告，通常是 `/sys/fs/bpf` 没有挂载 bpffs（`mount -t bpf bpf /sys/fs/bpf`，systemd 系统默认已挂载）。`ebpf-forward check` 会显示连接跟踪表是否已固定；`bpftool map show pinned /sys/fs/bpf/ebpf-forward/CT` 可直接查看
 - 也可以直接查看内核里的对象：`bpftool net show`、`tc filter show dev eth0 ingress`

@@ -146,6 +146,8 @@ pub struct Datapath {
     if_mtu: HashMap<MapData, u32, u32>,
     config: Array<MapData, GlobalConfig>,
     attached: BTreeMap<String, Attached>,
+    /// 挂载失败过的网卡：失败只在第一次记 warn，之后每 10 秒的重试降为 debug，避免刷日志。
+    attach_failed: HashSet<String>,
     pub ct_map_id: u32,
     pub stats_map_id: u32,
 }
@@ -197,6 +199,7 @@ impl Datapath {
             ct,
             ebpf,
             attached: BTreeMap::new(),
+            attach_failed: HashSet::new(),
             ct_map_id,
             stats_map_id,
         })
@@ -278,16 +281,26 @@ impl Datapath {
         for name in stale {
             self.detach(&name);
         }
+        self.attach_failed.retain(|n| names.contains(n.as_str()));
         for iface in wanted {
             if self.attached.contains_key(&iface.name) {
                 continue;
             }
             match self.attach(iface) {
-                Ok(prog) => info!(
-                    "已在网卡 {} (ifindex {}) 挂载 {prog}",
-                    iface.name, iface.index
-                ),
-                Err(e) => warn!("在网卡 {} 挂载 eBPF 失败: {e:#}", iface.name),
+                Ok(prog) => {
+                    self.attach_failed.remove(&iface.name);
+                    info!(
+                        "已在网卡 {} (ifindex {}) 挂载 {prog}",
+                        iface.name, iface.index
+                    );
+                }
+                Err(e) if self.attach_failed.insert(iface.name.clone()) => {
+                    warn!(
+                        "在网卡 {} 挂载 eBPF 失败: {e:#}（之后会定期重试）",
+                        iface.name
+                    );
+                }
+                Err(e) => debug!("在网卡 {} 挂载 eBPF 再次失败: {e:#}", iface.name),
             }
         }
     }
