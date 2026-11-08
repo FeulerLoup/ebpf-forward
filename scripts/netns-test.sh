@@ -161,8 +161,13 @@ if [[ ${NO_WG:-0} != 1 ]] && command -v wg >/dev/null && ip -n $R link add wg0 t
     (umask 077; wg genkey >$W/kr; wg genkey >$W/kg)
     PR=$(wg pubkey <$W/kr); PG=$(wg pubkey <$W/kg)
     ip -n $G link add wg0 type wireguard
-    nsx $R wg set wg0 private-key $W/kr listen-port 51820 peer "$PG" allowed-ips 10.20.0.2/32,fd00:20::2/128 endpoint 10.30.0.2:51820
-    nsx $G wg set wg0 private-key $W/kg listen-port 51820 peer "$PR" allowed-ips 10.20.0.1/32,fd00:20::1/128 endpoint 10.30.0.1:51820
+    # 较新的 Ubuntu（如 26.04）自带 wg 的 AppArmor profile，只允许它读 /etc/wireguard 下的文件，
+    # 私钥要经管道传入；配置失败时隧道不通，后面的 WireGuard 用例没有意义，直接跳过
+    if ! nsx $R wg set wg0 private-key <(cat $W/kr) listen-port 51820 peer "$PG" allowed-ips 10.20.0.2/32,fd00:20::2/128 endpoint 10.30.0.2:51820 \
+        || ! nsx $G wg set wg0 private-key <(cat $W/kg) listen-port 51820 peer "$PR" allowed-ips 10.20.0.1/32,fd00:20::1/128 endpoint 10.30.0.1:51820; then
+        bad "WireGuard 隧道配置失败（wg set），跳过 L3 网卡相关测试"
+        WG=0
+    fi
     ip -n $R addr add 10.20.0.1/24 dev wg0
     ip -n $G addr add 10.20.0.2/24 dev wg0
     ip -n $R -6 addr add fd00:20::1/64 dev wg0 nodad
