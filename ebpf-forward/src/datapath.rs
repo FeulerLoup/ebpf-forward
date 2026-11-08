@@ -111,13 +111,19 @@ fn prepare_ct_pin(pin_dir: &Path, ct_max: u32) -> Option<PathBuf> {
     }
 }
 
-/// 删除 pin 目录（固定的连接跟踪表随之销毁）；返回是否确实删除了东西。
+/// 删除固定的连接跟踪表 `pin_dir/CT`，pin 目录空了之后一并删除；返回是否确实删除了连接跟踪表。
+///
+/// 只删本程序固定的对象：`--pin-dir` 可能指到 `/sys/fs/bpf` 这类共享目录，不能整个删掉。
 pub fn remove_pins(pin_dir: &Path) -> Result<bool> {
-    if !pin_dir.exists() {
-        return Ok(false);
-    }
-    fs::remove_dir_all(pin_dir).with_context(|| format!("删除 {} 失败", pin_dir.display()))?;
-    Ok(true)
+    let ct = pin_dir.join(CT_PIN_NAME);
+    let removed = match fs::remove_file(&ct) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("删除 {} 失败", ct.display())),
+    };
+    // 目录里还有其他对象（或是 bpffs 挂载点本身）时 rmdir 会失败，正好保留
+    let _ = fs::remove_dir(pin_dir);
+    Ok(removed)
 }
 
 struct Attached {

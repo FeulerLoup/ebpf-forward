@@ -567,9 +567,15 @@ out=$(nsx $C curl -s --max-time 5 http://10.10.1.1:9090/who)
 [[ $out == srv-B ]] && ok "重启后新连接转发正常" || bad "重启后转发返回 '$out'"
 kill -9 $DAEMON_PID; wait $DAEMON_PID 2>/dev/null; DAEMON_PID=
 rm -f $W/run/ebpf-forward.pid
+# pin 目录里放一个别人的对象：--pin-dir 可能指到共享目录，cleanup 只能删自己的 CT
+mkdir $PIN/foreign
 efw cleanup >/dev/null
 nsx $R tc filter show dev r-cli ingress | grep -q fwd_ && bad "cleanup 后仍有残留挂载" || ok "cleanup 后没有残留挂载"
 [[ -e $PIN/CT ]] && bad "cleanup 后固定的连接跟踪表仍在" || ok "cleanup 删除了固定的连接跟踪表"
+[[ -d $PIN/foreign ]] && ok "cleanup 保留了 pin 目录里的其他对象" || bad "cleanup 删掉了 pin 目录里的其他对象"
+rmdir $PIN/foreign
+efw cleanup >/dev/null
+[[ -e $PIN ]] && bad "pin 目录空了之后 cleanup 没有删除它" || ok "pin 目录空了之后 cleanup 一并删除"
 
 echo
 grep -E 'WARN|ERROR' $W/daemon.log | grep -v 'ip_local_port_range' | head -5

@@ -475,7 +475,7 @@ pub fn cleanup(paths: &Paths, force: bool) -> Result<()> {
     match datapath::remove_pins(&paths.pin_dir) {
         Ok(true) => info(&format!(
             "已删除固定的连接跟踪表 {}（已有连接会中断）。",
-            paths.pin_dir.display()
+            paths.ct_pin().display()
         )),
         Ok(false) => {}
         Err(e) => warn(&format!("{e:#}")),
